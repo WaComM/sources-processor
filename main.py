@@ -9,6 +9,9 @@ Features:
 - Optional snapping of sources to nearest sea grid point (mask_rho == 1),
   controllable both via CLI and via a GUI checkbox.
 - Export modified GeoJSON (with i/j indices) via a GUI button and file browser.
+- Click on a source to:
+    * see its info in an overlay on the plot (index, i/j, lon/lat, properties)
+    * edit its properties via a JSON dialog (if tkinter is available).
 - Scroll wheel zoom.
 - Rectangle zoom with mouse drag.
 - Keyboard shortcuts:
@@ -35,10 +38,10 @@ import matplotlib.pyplot as plt
 from matplotlib.widgets import RectangleSelector, Button, CheckButtons
 from netCDF4 import Dataset
 
-# Optional: file browser for export
+# Optional: file browser & dialogs
 try:
     import tkinter as tk
-    from tkinter import filedialog
+    from tkinter import filedialog, messagebox
     TK_AVAILABLE = True
 except Exception:
     TK_AVAILABLE = False
@@ -296,6 +299,63 @@ def snap_to_nearest_sea(xi, eta, mask_rho, max_radius=50):
 
 
 # ---------------------------------------------------------------------
+# Tk-based dialog for editing properties
+# ---------------------------------------------------------------------
+def edit_properties_dialog(initial_props):
+    """
+    Open a Tk dialog to edit the properties dict as JSON.
+    Returns a new dict if OK pressed, or None if cancelled/invalid.
+    """
+    if not TK_AVAILABLE:
+        logging.warning("tkinter not available: cannot open edit dialog.")
+        return None
+
+    root = tk.Tk()
+    root.withdraw()
+
+    dialog = tk.Toplevel(root)
+    dialog.title("Edit source properties")
+
+    text = tk.Text(dialog, width=60, height=20)
+    text.pack(padx=10, pady=10, fill="both", expand=True)
+    text.insert("1.0", json.dumps(initial_props, indent=2))
+
+    result = {"props": None}
+
+    def on_ok():
+        content = text.get("1.0", "end-1c")
+        try:
+            new_props = json.loads(content)
+        except Exception as e:
+            messagebox.showerror(
+                "Invalid JSON",
+                f"Could not parse properties as JSON:\n{e}"
+            )
+            return
+        result["props"] = new_props
+        dialog.destroy()
+
+    def on_cancel():
+        dialog.destroy()
+
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(pady=(0, 10))
+
+    btn_ok = tk.Button(btn_frame, text="OK", command=on_ok, width=10)
+    btn_ok.pack(side="left", padx=5)
+
+    btn_cancel = tk.Button(btn_frame, text="Cancel", command=on_cancel, width=10)
+    btn_cancel.pack(side="left", padx=5)
+
+    dialog.transient(root)
+    dialog.grab_set()
+    root.wait_window(dialog)
+    root.destroy()
+
+    return result["props"]
+
+
+# ---------------------------------------------------------------------
 # Main logic
 # ---------------------------------------------------------------------
 def parse_args():
@@ -364,7 +424,7 @@ def main():
     ny, nx = data.shape
     logging.info(f"{args.var} shape: (eta={ny}, xi={nx})")
 
-    # Load GeoJSON sources (if any)
+    # Load GeoJSON sources
     sources_lon = None
     sources_lat = None
     gj = None
@@ -446,7 +506,7 @@ def main():
     # Status bar readout
     ax.format_coord = make_format_coord(data, lon_rho=lon_rho, lat_rho=lat_rho)
 
-    # Axes: bottom longitude, top xi, left latitude, right eta
+    # Axes layout: bottom lon, top xi, left lat, right eta
     if lon_rho is not None and lat_rho is not None:
         logging.info("Configuring axes: bottom=lon, top=xi, left=lat, right=eta.")
 
@@ -462,7 +522,7 @@ def main():
         ax.set_xticklabels(lon_labels)
         ax.set_xlabel("longitude (°E)")
 
-        # Top: xi index (identity transform)
+        # Top: xi index
         ax_top = ax.secondary_xaxis("top", functions=(lambda x: x, lambda x: x))
         ax_top.set_xticks(xticks)
         ax_top.set_xticklabels([str(i) for i in xticks])
@@ -474,7 +534,7 @@ def main():
         ax.set_yticklabels(lat_labels)
         ax.set_ylabel("latitude (°N)")
 
-        # Right: eta index (identity)
+        # Right: eta index
         ax_right = ax.secondary_yaxis("right", functions=(lambda y: y, lambda y: y))
         ax_right.set_yticks(yticks)
         ax_right.set_yticklabels([str(j) for j in yticks])
@@ -485,6 +545,19 @@ def main():
         )
         ax.set_xlabel("xi index")
         ax.set_ylabel("eta index")
+
+    # Info overlay (bottom-left in axes coordinates)
+    info_text = ax.text(
+        0.01, 0.01,
+        "",
+        transform=ax.transAxes,
+        fontsize=8,
+        va="bottom",
+        ha="left",
+        bbox=dict(facecolor="white", alpha=0.7, edgecolor="black"),
+        zorder=10,
+        visible=False,
+    )
 
     # State for sources
     state = {
@@ -497,6 +570,9 @@ def main():
         "gj": gj,
         "feature_indices": feature_indices,
         "sources_path": args.sources_geojson,
+        "info_text": info_text,
+        "lon_rho": lon_rho,
+        "lat_rho": lat_rho,
     }
 
     # Overlay particle sources
@@ -547,6 +623,7 @@ def main():
                 label="Lagrangian sources",
                 zorder=5
             )
+            scatter.set_picker(True)
             ax.legend(loc="upper right", fontsize=8)
 
             state["scatter"] = scatter
@@ -556,7 +633,7 @@ def main():
             state["xi_snapped"] = xi_snapped
             state["eta_snapped"] = eta_snapped
 
-            # GUI: Snap to sea checkbox
+            # Snap-to-sea checkbox
             if xi_snapped is not None:
                 ax_check = plt.axes([0.02, 0.80, 0.16, 0.10])
                 check = CheckButtons(
@@ -590,7 +667,7 @@ def main():
 
                 check.on_clicked(on_check)
 
-            # GUI: Export GeoJSON button
+            # Export GeoJSON button
             if state["gj"] is not None and state["feature_indices"] is not None:
                 ax_button = plt.axes([0.02, 0.70, 0.16, 0.06])
                 btn = Button(ax_button, "Export GeoJSON")
@@ -617,7 +694,6 @@ def main():
                         props["i"] = int(round(float(x)))
                         props["j"] = int(round(float(y)))
 
-                    # Default output name
                     base_out = "sources_with_indices"
                     if state["sources_path"] is not None:
                         in_path = state["sources_path"]
@@ -631,7 +707,6 @@ def main():
                         else "."
                     )
 
-                    # File browser (if available)
                     if TK_AVAILABLE:
                         try:
                             root = tk.Tk()
@@ -667,6 +742,78 @@ def main():
                         logging.error(f"Error writing GeoJSON file: {e}")
 
                 btn.on_clicked(on_export)
+
+            # Pick handler: show overlay + open edit dialog
+            def on_pick(event):
+                if event.artist is not state["scatter"]:
+                    return
+                ind = event.ind
+                if ind is None or len(ind) == 0:
+                    return
+                src_idx = int(ind[0])  # index in xi_raw/eta_raw arrays
+                gj_obj = state["gj"]
+                feat_idx = state["feature_indices"]
+                if gj_obj is None or feat_idx is None:
+                    return
+                if src_idx >= len(feat_idx):
+                    return
+
+                # Current coordinates (respect snap state)
+                use = state["use_snapped"]
+                if use and state["xi_snapped"] is not None:
+                    x = state["xi_snapped"][src_idx]
+                    y = state["eta_snapped"][src_idx]
+                else:
+                    x = state["xi_raw"][src_idx]
+                    y = state["eta_raw"][src_idx]
+
+                ix = int(round(x))
+                iy = int(round(y))
+
+                # lon/lat at that grid point (if available)
+                lon = lat = None
+                if state["lon_rho"] is not None and state["lat_rho"] is not None:
+                    ny_loc, nx_loc = state["lon_rho"].shape
+                    if 0 <= iy < ny_loc and 0 <= ix < nx_loc:
+                        lon = float(state["lon_rho"][iy, ix])
+                        lat = float(state["lat_rho"][iy, ix])
+
+                feat = gj_obj["features"][feat_idx[src_idx]]
+                props = feat.setdefault("properties", {})
+
+                # Build overlay text (compact)
+                lines = [
+                    f"Source #{src_idx}",
+                    f"i (xi) = {ix}, j (eta) = {iy}",
+                ]
+                if lon is not None and lat is not None:
+                    lines.append(f"lon = {lon:.5f}, lat = {lat:.5f}")
+                # Show up to a few properties
+                if props:
+                    lines.append("properties:")
+                    max_props = 6
+                    for k, v in list(props.items())[:max_props]:
+                        lines.append(f"  {k} = {v}")
+                    if len(props) > max_props:
+                        lines.append("  ...")
+                info_txt = "\n".join(lines)
+                state["info_text"].set_text(info_txt)
+                state["info_text"].set_visible(True)
+                ax.figure.canvas.draw_idle()
+
+                # If tkinter available, open dialog for editing
+                if TK_AVAILABLE:
+                    logging.info(f"Editing properties for source #{src_idx}")
+                    new_props = edit_properties_dialog(props)
+                    if new_props is not None:
+                        feat["properties"] = new_props
+                        logging.info(f"Updated properties for source #{src_idx}")
+                else:
+                    logging.warning(
+                        "tkinter not available: skipping edit dialog; overlay updated only."
+                    )
+
+            fig.canvas.mpl_connect("pick_event", on_pick)
 
     # Scroll zoom
     fig.canvas.mpl_connect("scroll_event", lambda event: scroll_zoom(event, ax))

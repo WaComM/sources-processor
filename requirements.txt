@@ -1,0 +1,3 @@
+NetCDF4
+numpy
+matplotlib

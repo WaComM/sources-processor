@@ -1,272 +1,259 @@
-# ROMS Grid & Lagrangian Sources Viewer
+# ROMS NetCDF 2D Interactive Viewer
 
-This tool is an interactive Python viewer for **ROMS-style NetCDF grid files** and **Lagrangian source locations** stored in a GeoJSON file.
+This tool is a small interactive GUI, written in Python + Matplotlib, to explore
+2D fields on a ROMS-style grid and to visualise / edit Lagrangian particle
+sources defined in a GeoJSON file.
 
-It is designed to help you:
-
-- Inspect grid fields such as `mask_rho` and `h` (bathymetry)
-- Visualize particle source locations on the grid
-- Snap sources to the nearest sea point (`mask_rho == 1`)
-- Interactively edit source properties
-- Export updated sources (with grid indices) to a JSON file ready for use in Lagrangian models
+It is designed primarily for grids that provide the standard ROMS variables
+`mask_rho`, `lon_rho`, `lat_rho`, and `h` (bathymetry).
 
 ---
 
-## Main Features
+## Main features
 
-- **2D field visualization**
-  - Opens a ROMS grid NetCDF file
-  - Displays a 2D variable (default: `mask_rho`)
-  - Overlays **bathymetry contours** (`h`), masked on sea if `mask_rho` is available
+- **2D field viewer**
+  - Visualise any 2D variable from a ROMS-style NetCDF file
+    (default: `mask_rho`).
+  - Scroll-wheel zoom (centered on the mouse cursor).
+  - Rectangle zoom by dragging the mouse.
+  - Keyboard shortcuts:
+    - `r` : reset view to full domain
+    - `+` : zoom in (around current view center)
+    - `-` : zoom out (around current view center)
 
-- **Coastal / marine grid-aware plot**
-  - Uses **indices** and **geographical coordinates** on the axes:
-    - **Bottom X axis**: longitude (°E)
-    - **Top X axis**: xi index
-    - **Left Y axis**: latitude (°N)
-    - **Right Y axis**: eta index
-  - Status bar shows: `xi`, `eta`, `lon`, `lat`, and field value under the cursor
+- **Bathymetry overlay**
+  - If `h` is present in the NetCDF, bathymetry contours are plotted
+    on top of the 2D field.
+  - If `mask_rho` is also present, contours are masked on land
+    (`mask_rho < 0.5`).
 
-- **Lagrangian sources visualization**
-  - Reads a **GeoJSON file** containing `Point` features (lon/lat)
-  - Maps each source onto the grid indices (`xi`, `eta`) using `lon_rho` / `lat_rho`
-  - Displays sources as red circles over the field
+- **Lagrangian sources overlay (GeoJSON)**
+  - Load a GeoJSON file containing **Point** features with lon/lat
+    coordinates (e.g. particle release locations).
+  - Each Point is mapped from (lon, lat) to approximate grid indices (xi, eta)
+    using the `lon_rho` and `lat_rho` fields.
+  - A **Snap to sea** checkbox allows you to snap each source to the nearest
+    sea grid point (`mask_rho >= 0.5`).
+  - Clicking on a source:
+    - Shows an information overlay (index, i/j, lon/lat, properties).
+    - If `tkinter` is available, opens a JSON editor dialog to modify the
+      feature `properties` on the fly.
 
-- **Snapping sources to sea**
-  - Optionally moves each source to the **nearest sea grid cell** where `mask_rho >= 0.5`
-  - Search is done in an expanding square neighborhood around the original mapped position
+- **GeoJSON/JSON export with (i, j, k)**
+  - A button *Export JSON* opens a file browser to save a modified GeoJSON/JSON
+    file.
+  - For each Point feature, the script writes:
+    - `i` = xi index (integer)
+    - `j` = eta index (integer)
+    - Optionally `k` (vertical index), if all the following are available:
+      - `--sw` vertical stretch vector is provided on the command line
+      - `h` (bathymetry) exists in the NetCDF file
+      - the feature `properties` contain a numeric field `depth`
+        (depth below the free surface, positive downward, in metres).
+    - In that case, the viewer uses a simple sigma representation
+      `z = s * H`, `depth = -z = -s*H`, so
+      `s_target = -depth/H`, and chooses the index `k` where `sw[k]`
+      is closest to `s_target`.
 
-- **Interactive GUI controls**
-  - Mouse scroll wheel: zoom in/out
-  - Click-and-drag rectangle: zoom to a selected box
-  - Keyboard:
-    - `r` → reset view
-    - `+` → zoom in (centered on current view)
-    - `-` → zoom out (centered on current view)
-  - **Snap to sea** checkbox:
-    - Toggles between original mapped positions and snapped sea positions
-  - **Export GeoJSON** button:
-    - Opens a file browser
-    - Saves a `.json` file with updated `i` and `j` indices in each source’s properties
-
-- **Source inspection & editing**
-  - Click on a source marker:
-    - Shows an **info overlay** with:
-      - Source index
-      - Grid indices `i` (`xi`) and `j` (`eta`)
-      - Longitude / latitude at that grid point
-      - A compact listing of the source’s properties
-    - If `tkinter` is available:
-      - Opens a **JSON editor dialog** to manually edit the source’s properties
+- **Axes and status bar**
+  - If `lon_rho` / `lat_rho` exist:
+    - Bottom axis: longitude (°E)
+    - Top axis: `xi` index
+    - Left axis: latitude (°N)
+    - Right axis: `eta` index
+  - Otherwise, indices are used on both axes.
+  - A custom status bar (mouse position) shows:
+    - `xi`, `eta`
+    - `lon`, `lat` (if available)
+    - 2D field value at that location.
 
 ---
 
 ## Requirements
 
 - Python 3.8+
-- Python packages:
+- Recommended libraries:
   - `numpy`
-  - `matplotlib`
+  - `matplotlib` (3.5+; 3.8+ is supported via the new `RectangleSelector` API)
   - `netCDF4`
-- Optional (but recommended):
-  - `tkinter` (usually available by default on many systems)
-    - Required for:
-      - File browser (save dialog)
-      - Property editing dialog
-    - If not available:
-      - Export falls back to a default path (no GUI dialog)
-      - Manual property editing via GUI is disabled
-- Input data:
-  - **NetCDF** ROMS-style grid file, containing at least:
-    - `mask_rho(eta_rho, xi_rho)` (default field)
-    - `h(eta_rho, xi_rho)` for bathymetry (optional but recommended)
-    - `lon_rho(eta_rho, xi_rho)` and `lat_rho(eta_rho, xi_rho)` (for axes and mapping)
-  - **GeoJSON** file with Lagrangian sources:
-    - `type = "FeatureCollection"`
-    - Features of type `Point` with `[lon, lat]` coordinates
+  - `tkinter` (for file dialogs and JSON property editor)
+- A ROMS-style NetCDF grid file containing, ideally:
+  - `mask_rho` (2D)
+  - `h` (bathymetry, 2D)
+  - `lon_rho`, `lat_rho` (2D longitude and latitude)
+- Optionally, a GeoJSON file with a `FeatureCollection` of `Point` geometries.
 
----
-
-## Installation
-
-Install the required Python packages, for example using `pip`:
+You can install the Python dependencies with:
 
 ```bash
 pip install numpy matplotlib netCDF4
 ```
 
-On some systems you may need to install `tkinter` separately, e.g.:
-
-- Ubuntu/Debian:
-
-  ```bash
-  sudo apt-get install python3-tk
-  ```
-
-- macOS (with Homebrew for Python) usually includes `tkinter` by default; otherwise use the official Python installer from python.org.
+On many systems `tkinter` is provided by the OS or a system package, e.g.
+`python3-tk` on Debian/Ubuntu-like distributions.
 
 ---
 
 ## Usage
 
-### Basic command
+### Basic 2D field viewing
 
 ```bash
-python main.py path/to/grid.nc
+python main.py grid.nc
 ```
 
 This will:
 
-- Open `grid.nc`
-- Display the `mask_rho` variable by default
-- Show bathymetry contours if `h` is available
+- open `grid.nc`
+- display the variable `mask_rho` by default
+- try to overlay bathymetry contours from `h` if available
 
-### With Lagrangian sources
-
-```bash
-python main.py   /path/to/Campania_max135m_withC3andC4_angle0_hmin_2_5.nc   --var mask_rho   --cmap gray_r   --loglevel INFO   --sources-geojson /path/to/sources-campania_region.json
-```
-
-This will:
-
-- Plot `mask_rho`
-- Overlay the sources from `sources-campania_region.json` as red circles
-- Map each GeoJSON point’s lon/lat to the ROMS grid
-
-### With snapping enabled from the start
+To choose another 2D variable (for example `zeta`):
 
 ```bash
-python main.py   /path/to/Campania_max135m_withC3andC4_angle0_hmin_2_5.nc   --var mask_rho   --cmap gray_r   --loglevel INFO   --sources-geojson /path/to/sources-campania_region.json   --snap-sources-to-sea
+python main.py grid.nc --var zeta
 ```
 
-The initial source positions will be set to their **nearest sea grid points** according to `mask_rho`.
+To change the colormap:
+
+```bash
+python main.py grid.nc --cmap viridis
+```
+
+To set the logging level (e.g. debug):
+
+```bash
+python main.py grid.nc --loglevel DEBUG
+```
+
+### With Lagrangian sources from GeoJSON
+
+Suppose you have a GeoJSON file `sources.geojson` like:
+
+```jsonc
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [14.123, 40.567]  // lon, lat
+      },
+      "properties": {
+        "id": 1,
+        "depth": 5.0
+      }
+    }
+  ]
+}
+```
+
+You can overlay these sources as follows:
+
+```bash
+python main.py grid.nc --sources-geojson sources.geojson
+```
+
+In the GUI:
+
+- Each point source appears as a red circle.
+- Use the `Snap to sea` checkbox to project the source onto the nearest
+  sea point (where `mask_rho >= 0.5`).
+- Click on a source to see its info and, if `tkinter` is available, to edit
+  its `properties` JSON interactively.
+
+### Computing vertical level `k` from depth (`--sw`)
+
+If your GeoJSON `properties` include a `depth` field (in metres) and you
+want to obtain the vertical level index `k` corresponding to that depth,
+you must pass a vertical stretch vector via `--sw`.
+
+The `--sw` argument expects a **comma-separated list** of sigma values,
+typically going from `-1` (bottom) to `0` (surface).
+
+#### Simple example (5 vertical levels)
+
+```bash
+python main.py grid.nc \
+  --sources-geojson sources.geojson \
+  --sw -1,-0.75,-0.5,-0.25,0
+```
+
+In this configuration:
+
+- `sw[0] = -1`  → bottom
+- `sw[4] = 0`   → surface
+- `k` will range from 0 to 4.
+
+#### Realistic ROMS-style example (31 levels)
+
+```bash
+python main.py grid.nc \
+  --sources-geojson sources.geojson \
+  --sw -1,-0.966666666666667,-0.933333333333333,-0.9,-0.866666666666667,\
+-0.833333333333333,-0.8,-0.766666666666667,-0.733333333333333,-0.7,\
+-0.666666666666667,-0.633333333333333,-0.6,-0.566666666666667,\
+-0.533333333333333,-0.5,-0.466666666666667,-0.433333333333333,-0.4,\
+-0.366666666666667,-0.333333333333333,-0.3,-0.266666666666667,\
+-0.233333333333333,-0.2,-0.166666666666667,-0.133333333333333,\
+-0.1,-0.0666666666666667,-0.0333333333333333,0
+```
+
+During export (see below), for each feature with a valid `depth` property:
+
+1. The code reads the local bathymetry `H = h(j, i)`.
+2. Computes a target sigma level `s_target = -depth / H`.
+3. Chooses `k` such that `sw[k]` is closest to `s_target`.
+4. Stores `k` in the feature properties.
+
+If `h` is missing, `depth` is missing, or `--sw` is not provided, `k`
+is not computed.
 
 ---
 
-## GUI Controls
+## Exporting modified JSON (with i, j, k)
 
-### Navigation
+The viewer provides an **Export JSON** button in the figure (left side).
 
-- **Mouse scroll wheel**:
-  - Scroll up → Zoom in
-  - Scroll down → Zoom out
-- **Rectangle zoom**:
-  - Left-click + drag to draw a rectangle
-  - Release to zoom into that rectangle
-- **Keyboard**:
-  - `r` → Reset view to full grid
-  - `+` → Zoom in (centered on current view)
-  - `-` → Zoom out (centered on current view)
+When you click **Export JSON**:
 
-### Axes
+1. Each Point feature is updated with:
+   - `i`, `j`: horizontal grid indices (xi, eta) of the point,
+     either raw or snapped, depending on the current GUI state.
+   - `k`: vertical index derived from `depth` and `--sw` (optional).
+2. A file browser dialog opens, allowing you to choose the output file
+   name and location (extension `.json` is enforced).
+3. A JSON/GeoJSON file is written containing the updated features.
 
-If `lon_rho` and `lat_rho` are present:
-
-- Bottom X axis: **longitude (°E)**
-- Top X axis: **xi index**
-- Left Y axis: **latitude (°N)**
-- Right Y axis: **eta index**
-
-In the lower-right status bar (default Matplotlib status line):
-
-- You see the current grid indices and coordinates under the mouse:
-  - `xi, eta`
-  - `lon, lat`
-  - Field value
+The exported file is fully editable and reusable e.g. as input for
+a Lagrangian model that needs grid indices `(i, j, k)` in addition
+to geographic coordinates.
 
 ---
 
-## Working with Sources
+## Keyboard and mouse recap
 
-### Viewing sources
-
-- If `--sources-geojson` is provided:
-  - Red circles mark the source positions
-  - Positions are computed from lon/lat using `lon_rho` / `lat_rho`
-
-### Snap to sea
-
-- In the GUI, there is a **“Snap to sea”** checkbox (top-left panel).
-- When enabled:
-  - Each source is moved to the **nearest sea cell** where `mask_rho >= 0.5`.
-- When disabled:
-  - Sources are shown at their original mapped positions (from lon/lat).
-
-### Source info overlay
-
-- **Click on a red source marker**:
-  - A small white info box appears at the bottom-left of the plot.
-  - It shows:
-    - `Source #N` (index)
-    - `i (xi)` and `j (eta)` grid indices
-    - `lon`, `lat` at that grid cell (if available)
-    - Source properties (truncated list to keep it compact)
-
-### Editing source properties
-
-- When you click a source:
-  - If `tkinter` is available:
-    - A JSON editor dialog pops up.
-    - The dialog contains the source’s `properties` object.
-    - You can add/change/remove fields.
-    - Press **OK** to save changes, or **Cancel** to discard.
-  - If `tkinter` is not available:
-    - The overlay is updated only, but manual property editing via GUI is disabled.
-
-> Note: Editing properties in the dialog updates the in-memory GeoJSON state. Changes are not written to disk until you export.
+- **Mouse wheel**: zoom in/out around the cursor.
+- **Left-drag** (rectangle on the field): zoom to the selected area.
+- **r**: reset to the full grid extent.
+- **+**: zoom in (about the current view center).
+- **-**: zoom out (about the current view center).
+- **Click on a source**:
+  - Show information overlay.
+  - If `tkinter` is available, open JSON editor for the source properties.
 
 ---
 
-## Exporting the Modified GeoJSON
+## Notes and limitations
 
-Use the **“Export GeoJSON”** button in the small control panel (top-left).
-
-What happens:
-
-1. The tool updates each `Point` feature’s properties with:
-   - `i` → xi index (integer)
-   - `j` → eta index (integer)
-   - These indices depend on the current **snap state**:
-     - If **Snap to sea** is enabled:
-       - `i` / `j` are taken from the **snapped** positions.
-     - If disabled:
-       - `i` / `j` are taken from the original mapped positions.
-
-2. A **file save dialog** is opened (if `tkinter` is available):
-   - Default filename:
-     - `<input_basename>_snapped.json` if snapping is active
-     - `<input_basename>_indices.json` otherwise
-   - Default extension: `.json`
-
-3. The file is written as pretty-printed JSON (`indent=2`, UTF-8).
-
-If `tkinter` is **not** available:
-
-- The export falls back to a default path:
-  - In the same directory as the input GeoJSON
-  - With the same `_snapped` or `_indices` suffix
-- No GUI dialog is shown.
-
----
-
-## Notes and Limitations
-
-- The mapping from lon/lat to grid indices uses:
-  - A 1D interpolation along a **middle row** (for longitude → xi)
-  - A 1D interpolation along a **middle column** (for latitude → eta)
-  - This assumes the usual ROMS curvilinear grid structure without extreme distortions.
-- Snapping to sea uses a maximum search radius (default: 50 grid cells).
-  - If no sea cell is found within that radius, the original mapped position is kept.
-- The GUI is based on **Matplotlib** plus optional **tkinter**.
-  - On some headless / server environments, you may need to:
-    - Use a non-interactive backend (e.g. `Agg`) for plotting only
-    - Or run the script on a local machine with a graphical environment
-
----
-
-## License
-
-This script is provided as-is, without warranty.  
-You are free to adapt and integrate it into your own ROMS / Lagrangian modeling workflow.
-
----
+- The lon/lat → (xi, eta) mapping is approximate and based on 1D interpolation
+  along a central row/column. It is generally adequate for reasonably smooth
+  grids but not a full inverse transform.
+- The `depth → k` conversion uses a simple sigma representation and ignores
+  free-surface elevation (`zeta ~ 0`). For more sophisticated vertical
+  coordinate handling, the logic can be extended to include ROMS metadata
+  (e.g. `hc`, `Cs_w`, `Vtransform`, etc.).
+- If `tkinter` is not available, you still get the viewer and overlays,
+  but you cannot edit properties via dialog and cannot use the file browser
+  (export is disabled in that case).

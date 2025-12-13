@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Use the system's default Python 3 interpreter to run this script.
+
 """
 Interactive viewer for 2D fields in a ROMS-style NetCDF grid.
 
@@ -9,7 +11,7 @@ Features:
 - Optional snapping of sources to nearest sea grid point (mask_rho == 1),
   controllable both via CLI and via a GUI checkbox.
 - Export modified JSON/GeoJSON (with i/j indices and optional k vertical index)
-  via a GUI button and file browser. k is computed from depth using --sw.
+  via a GUI button and file browser. k is computed from depth using --s_rho.
 - If the file browser cannot be opened (no tkinter / error), and
   --default-output-json is provided, export will write to that path instead.
 - Click on a source to:
@@ -27,27 +29,61 @@ Features:
     top    : xi index
     left   : latitude (°N)
     right  : eta index
+
+Example of --s_rho usage:
+--s_rho ="-0.983333333333333,-0.95,-0.916666666666667,-0.883333333333333,-0.85,-0.816666666666667,-0.783333333333333,-0.75,-0.716666666666667,-0.683333333333333,-0.65,-0.616666666666667,-0.583333333333333,-0.55,-0.516666666666667,-0.483333333333333,-0.45,-0.416666666666667,-0.383333333333333,-0.35,-0.316666666666667,-0.283333333333333,-0.25,-0.216666666666667,-0.183333333333333,-0.15,-0.116666666666667,-0.0833333333333333,-0.05,-0.0166666666666667"
 """
 
-import sys
-import os
-import argparse
-import logging
-import json
+#!/usr/bin/env python3
+"""
+Interactive viewer for 2D fields in a ROMS-style NetCDF grid.
 
-import numpy as np
-import matplotlib
-import matplotlib.pyplot as plt
-from matplotlib.widgets import RectangleSelector, Button, CheckButtons
-from netCDF4 import Dataset
+IMPORTANT macOS/Python 3.13 stability note:
+- The Matplotlib "MacOSX" backend + tkinter usage is a frequent crash source.
+- This script forces the "TkAgg" backend when tkinter is available.
+  (Must be done BEFORE importing matplotlib.pyplot.)
+"""
 
-# Optional: file browser & dialogs (tkinter)
+# ------------------------------
+# Standard library imports
+# ------------------------------
+import sys  # Exit, argv.
+import os  # Paths, environment.
+import argparse  # CLI parsing.
+import logging  # Logging.
+import json  # GeoJSON read/write.
+
+# ------------------------------
+# Optional tkinter imports
+# ------------------------------
 try:
-    import tkinter as tk
-    from tkinter import filedialog, messagebox
-    TK_AVAILABLE = True
+    import tkinter as tk  # GUI toolkit.
+    from tkinter import filedialog, messagebox  # Dialog helpers.
+    TK_AVAILABLE = True  # Flag: tkinter is usable.
 except Exception:
-    TK_AVAILABLE = False
+    TK_AVAILABLE = False  # Flag: no tkinter.
+    tk = None
+    filedialog = None
+    messagebox = None
+
+# ------------------------------
+# Matplotlib backend selection (MUST be before pyplot import)
+# ------------------------------
+import matplotlib  # Matplotlib core.
+
+# Force TkAgg when tkinter exists; otherwise keep default (or use Agg headless).
+if TK_AVAILABLE:
+    # If user explicitly sets MPLBACKEND, respect it; else force TkAgg.
+    if not os.environ.get("MPLBACKEND"):
+        matplotlib.use("TkAgg", force=True)
+
+# ------------------------------
+# Third-party imports
+# ------------------------------
+import numpy as np  # Arrays.
+import matplotlib.pyplot as plt  # Pyplot (after backend chosen).
+from matplotlib.widgets import RectangleSelector, Button, CheckButtons  # Widgets.
+from netCDF4 import Dataset  # NetCDF.
 
 
 # ---------------------------------------------------------------------
@@ -55,112 +91,107 @@ except Exception:
 # ---------------------------------------------------------------------
 def apply_zoom(ax, x_center, y_center, scale_factor):
     """Zoom axes around (x_center, y_center) by scale_factor."""
-    xmin, xmax = ax.get_xlim()
-    ymin, ymax = ax.get_ylim()
-
-    width = (xmax - xmin) * scale_factor
-    height = (ymax - ymin) * scale_factor
+    xmin, xmax = ax.get_xlim()  # Current x limits.
+    ymin, ymax = ax.get_ylim()  # Current y limits.
 
     if xmax == xmin or ymax == ymin:
-        return
+        return  # Avoid division by zero.
+
+    width = (xmax - xmin) * scale_factor  # New width.
+    height = (ymax - ymin) * scale_factor  # New height.
 
     ax.set_xlim([
         x_center - width * (x_center - xmin) / (xmax - xmin),
         x_center + width * (xmax - x_center) / (xmax - xmin)
-    ])
+    ])  # Update x range.
+
     ax.set_ylim([
         y_center - height * (y_center - ymin) / (ymax - ymin),
         y_center + height * (ymax - y_center) / (ymax - ymin)
-    ])
-    ax.figure.canvas.draw_idle()
+    ])  # Update y range.
+
+    ax.figure.canvas.draw_idle()  # Redraw.
 
 
 def scroll_zoom(event, ax):
     """Mouse scroll wheel zoom."""
     if event.inaxes != ax or event.xdata is None or event.ydata is None:
-        return
+        return  # Ignore scrolls outside axes.
 
     if event.button == "up":
-        scale = 1 / 1.2
+        scale = 1 / 1.2  # Zoom in.
     elif event.button == "down":
-        scale = 1.2
+        scale = 1.2  # Zoom out.
     else:
         return
 
-    apply_zoom(ax, event.xdata, event.ydata, scale)
+    apply_zoom(ax, event.xdata, event.ydata, scale)  # Apply zoom at cursor.
 
 
 def zoom_rect(eclick, erelease, ax):
     """Rectangle zoom using drag."""
     if eclick.xdata is None or erelease.xdata is None:
-        return
+        return  # Ignore invalid drag.
 
-    x1, y1 = eclick.xdata, eclick.ydata
-    x2, y2 = erelease.xdata, erelease.ydata
+    x1, y1 = eclick.xdata, eclick.ydata  # Start.
+    x2, y2 = erelease.xdata, erelease.ydata  # End.
 
-    ax.set_xlim(min(x1, x2), max(x1, x2))
-    ax.set_ylim(min(y1, y2), max(y1, y2))
-    ax.figure.canvas.draw_idle()
+    ax.set_xlim(min(x1, x2), max(x1, x2))  # Set x selection.
+    ax.set_ylim(min(y1, y2), max(y1, y2))  # Set y selection.
+    ax.figure.canvas.draw_idle()  # Redraw.
 
 
 # ---------------------------------------------------------------------
 # Event handlers
 # ---------------------------------------------------------------------
-def make_key_handler(ax, data_shape, full_extent):
+def make_key_handler(ax, full_extent):
     """Return keypress handler with access to full extent."""
-    xmin_full, xmax_full, ymin_full, ymax_full = full_extent
+    xmin_full, xmax_full, ymin_full, ymax_full = full_extent  # Full bounds.
 
     def on_key(event):
         if event.inaxes not in (ax, None):
-            return
+            return  # Ignore keys not for our figure.
 
-        key = event.key
+        key = event.key  # Key pressed.
         logging.debug(f"Key pressed: {key}")
 
         if key == "r":
-            ax.set_xlim(xmin_full, xmax_full)
-            ax.set_ylim(ymin_full, ymax_full)
-            ax.figure.canvas.draw_idle()
+            ax.set_xlim(xmin_full, xmax_full)  # Reset x.
+            ax.set_ylim(ymin_full, ymax_full)  # Reset y.
+            ax.figure.canvas.draw_idle()  # Redraw.
 
         elif key == "+":
-            cur_xmin, cur_xmax = ax.get_xlim()
-            cur_ymin, cur_ymax = ax.get_ylim()
-            cx = 0.5 * (cur_xmin + cur_xmax)
-            cy = 0.5 * (cur_ymin + cur_ymax)
-            apply_zoom(ax, cx, cy, 1 / 1.2)
+            cur_xmin, cur_xmax = ax.get_xlim()  # Current x.
+            cur_ymin, cur_ymax = ax.get_ylim()  # Current y.
+            cx = 0.5 * (cur_xmin + cur_xmax)  # Center x.
+            cy = 0.5 * (cur_ymin + cur_ymax)  # Center y.
+            apply_zoom(ax, cx, cy, 1 / 1.2)  # Zoom in.
 
         elif key == "-":
             cur_xmin, cur_xmax = ax.get_xlim()
             cur_ymin, cur_ymax = ax.get_ylim()
             cx = 0.5 * (cur_xmin + cur_xmax)
             cy = 0.5 * (cur_ymin + cur_ymax)
-            apply_zoom(ax, cx, cy, 1.2)
+            apply_zoom(ax, cx, cy, 1.2)  # Zoom out.
 
     return on_key
 
 
 def make_format_coord(data, lon_rho=None, lat_rho=None):
-    """
-    Custom coordinate formatter showing indices, value and lon/lat if available.
-    """
-    ny, nx = data.shape
+    """Custom coordinate formatter showing indices, value and lon/lat if available."""
+    ny, nx = data.shape  # Data size.
 
     def format_coord(x, y):
-        col = int(round(x))
-        row = int(round(y))
+        col = int(round(x))  # xi.
+        row = int(round(y))  # eta.
         if 0 <= col < nx and 0 <= row < ny:
-            z = data[row, col]
+            z = data[row, col]  # Value.
             if lon_rho is not None and lat_rho is not None:
                 lon = lon_rho[row, col]
                 lat = lat_rho[row, col]
-                return (
-                    f"xi={col:d}, eta={row:d}, "
-                    f"lon={lon:.5f}, lat={lat:.5f}, value={z:.3f}"
-                )
-            else:
-                return f"xi={col:d}, eta={row:d}, value={z:.3f}"
-        else:
-            return f"x={x:.2f}, y={y:.2f}"
+                return f"xi={col:d}, eta={row:d}, lon={lon:.5f}, lat={lat:.5f}, value={z:.3f}"
+            return f"xi={col:d}, eta={row:d}, value={z:.3f}"
+        return f"x={x:.2f}, y={y:.2f}"
 
     return format_coord
 
@@ -170,58 +201,40 @@ def make_format_coord(data, lon_rho=None, lat_rho=None):
 # ---------------------------------------------------------------------
 def use_new_rectangle_selector_api():
     """Return True if Matplotlib version is >= 3.8 (new RectangleSelector API)."""
-    ver = matplotlib.__version__
-    parts = ver.split(".")
+    ver = matplotlib.__version__  # Version string.
+    parts = ver.split(".")  # Split.
     try:
-        major = int(parts[0])
-        minor = int(parts[1]) if len(parts) > 1 else 0
+        major = int(parts[0])  # Major.
+        minor = int(parts[1]) if len(parts) > 1 else 0  # Minor.
     except ValueError:
-        return True
-
+        return True  # Default to new API if parsing fails.
     return (major > 3) or (major == 3 and minor >= 8)
 
 
 # ---------------------------------------------------------------------
-# Lon/lat -> grid index mapping
+# Lon/lat -> grid index mapping (approx)
 # ---------------------------------------------------------------------
 def build_lonlat_index_mappers(lon_rho, lat_rho):
-    """
-    Build helpers to convert (lon, lat) to approximate (xi, eta)
-    via 1D interpolation along a central row and column.
-    """
-    ny, nx = lon_rho.shape
+    """Approximate (lon,lat)->(xi,eta) using 1D interpolation on mid row/col."""
+    ny, nx = lon_rho.shape  # Grid size.
 
-    # Middle row for lon -> xi
-    j_mid = ny // 2
-    lon_mid = lon_rho[j_mid, :]
-    xi_idx = np.arange(nx)
-    lon_sort_idx = np.argsort(lon_mid)
-    lon_sorted = lon_mid[lon_sort_idx]
-    xi_sorted = xi_idx[lon_sort_idx]
+    j_mid = ny // 2  # Mid row.
+    lon_mid = lon_rho[j_mid, :]  # Lon along mid row.
+    xi_idx = np.arange(nx)  # Xi indices.
+    lon_sort_idx = np.argsort(lon_mid)  # Sorting indices.
+    lon_sorted = lon_mid[lon_sort_idx]  # Sorted lon.
+    xi_sorted = xi_idx[lon_sort_idx]  # Xi aligned with sorted lon.
 
-    # Middle column for lat -> eta
-    i_mid = nx // 2
-    lat_mid = lat_rho[:, i_mid]
-    eta_idx = np.arange(ny)
-    lat_sort_idx = np.argsort(lat_mid)
-    lat_sorted = lat_mid[lat_sort_idx]
-    eta_sorted = eta_idx[lat_sort_idx]
+    i_mid = nx // 2  # Mid col.
+    lat_mid = lat_rho[:, i_mid]  # Lat along mid col.
+    eta_idx = np.arange(ny)  # Eta indices.
+    lat_sort_idx = np.argsort(lat_mid)  # Sorting indices.
+    lat_sorted = lat_mid[lat_sort_idx]  # Sorted lat.
+    eta_sorted = eta_idx[lat_sort_idx]  # Eta aligned.
 
     def lonlat_to_ij(lon, lat):
-        xi = np.interp(
-            lon,
-            lon_sorted,
-            xi_sorted,
-            left=xi_sorted[0],
-            right=xi_sorted[-1]
-        )
-        eta = np.interp(
-            lat,
-            lat_sorted,
-            eta_sorted,
-            left=eta_sorted[0],
-            right=eta_sorted[-1]
-        )
+        xi = np.interp(lon, lon_sorted, xi_sorted, left=xi_sorted[0], right=xi_sorted[-1])
+        eta = np.interp(lat, lat_sorted, eta_sorted, left=eta_sorted[0], right=eta_sorted[-1])
         return xi, eta
 
     return lonlat_to_ij
@@ -231,25 +244,17 @@ def build_lonlat_index_mappers(lon_rho, lat_rho):
 # Snap sources to nearest sea point
 # ---------------------------------------------------------------------
 def snap_to_nearest_sea(xi, eta, mask_rho, max_radius=50):
-    """
-    Move a source at (xi, eta) to the nearest grid point where
-    mask_rho >= 0.5 (sea). Search in expanding square windows
-    up to max_radius cells.
-    """
-    ny, nx = mask_rho.shape
+    """Snap (xi,eta) to nearest sea (mask_rho>=0.5) within max_radius."""
+    ny, nx = mask_rho.shape  # Shape.
 
-    i0 = int(round(xi))
-    j0 = int(round(eta))
+    i0 = int(round(xi))  # Start i.
+    j0 = int(round(eta))  # Start j.
 
-    i0 = max(0, min(nx - 1, i0))
-    j0 = max(0, min(ny - 1, j0))
+    i0 = max(0, min(nx - 1, i0))  # Clamp i.
+    j0 = max(0, min(ny - 1, j0))  # Clamp j.
 
     if mask_rho[j0, i0] >= 0.5:
-        return float(i0), float(j0)
-
-    best_i = None
-    best_j = None
-    best_dist2 = None
+        return float(i0), float(j0)  # Already sea.
 
     for r in range(1, max_radius + 1):
         i_min = max(0, i0 - r)
@@ -270,81 +275,57 @@ def snap_to_nearest_sea(xi, eta, mask_rho, max_radius=50):
         dy = jj_global.astype(float) - eta
         dist2 = dx * dx + dy * dy
 
-        k = np.argmin(dist2)
-        best_i = int(ii_global[k])
-        best_j = int(jj_global[k])
-        best_dist2 = float(dist2[k])
-        break
+        k = int(np.argmin(dist2))
+        return float(ii_global[k]), float(jj_global[k])
 
-    if best_i is None:
-        logging.warning(
-            f"No sea point found within radius {max_radius} for source at "
-            f"(xi={xi:.2f}, eta={eta:.2f}). Keeping original position."
-        )
-        return float(xi), float(eta)
-
-    logging.debug(
-        f"Snapped source from (xi={xi:.2f}, eta={eta:.2f}) "
-        f"to (xi={best_i}, eta={best_j}), dist2={best_dist2:.2f}"
+    logging.warning(
+        f"No sea point found within radius {max_radius} for source at "
+        f"(xi={xi:.2f}, eta={eta:.2f}). Keeping original position."
     )
-    return float(best_i), float(best_j)
+    return float(xi), float(eta)
 
 
 # ---------------------------------------------------------------------
-# Tk-based dialog for editing properties
+# Tk-based dialog for editing properties (uses Matplotlib Tk window as parent)
 # ---------------------------------------------------------------------
-def edit_properties_dialog(initial_props):
-    """
-    Open a Tk dialog to edit the properties dict as JSON.
-    Returns a new dict if OK, or None if cancelled/invalid.
-    """
-    if not TK_AVAILABLE:
-        logging.warning("tkinter not available: cannot open edit dialog.")
+def edit_properties_dialog(parent, initial_props):
+    """Open a modal dialog to edit a dict as JSON; returns dict or None."""
+    if not TK_AVAILABLE or parent is None:
+        logging.warning("tkinter not available (or no parent): cannot open edit dialog.")
         return None
 
-    root = tk.Tk()
-    root.withdraw()
+    dialog = tk.Toplevel(parent)  # Child window.
+    dialog.title("Edit source properties")  # Title.
 
-    dialog = tk.Toplevel(root)
-    dialog.title("Edit source properties")
+    text = tk.Text(dialog, width=60, height=20)  # JSON editor.
+    text.pack(padx=10, pady=10, fill="both", expand=True)  # Layout.
+    text.insert("1.0", json.dumps(initial_props, indent=2))  # Initial JSON.
 
-    text = tk.Text(dialog, width=60, height=20)
-    text.pack(padx=10, pady=10, fill="both", expand=True)
-    text.insert("1.0", json.dumps(initial_props, indent=2))
-
-    result = {"props": None}
+    result = {"props": None}  # Store result.
 
     def on_ok():
-        content = text.get("1.0", "end-1c")
+        content = text.get("1.0", "end-1c")  # Get text.
         try:
-            new_props = json.loads(content)
+            result["props"] = json.loads(content)  # Parse JSON.
         except Exception as e:
-            messagebox.showerror(
-                "Invalid JSON",
-                f"Could not parse properties as JSON:\n{e}"
-            )
+            messagebox.showerror("Invalid JSON", f"Could not parse properties as JSON:\n{e}", parent=dialog)
             return
-        result["props"] = new_props
-        dialog.destroy()
+        dialog.destroy()  # Close dialog.
 
     def on_cancel():
-        dialog.destroy()
+        dialog.destroy()  # Close without saving.
 
-    btn_frame = tk.Frame(dialog)
-    btn_frame.pack(pady=(0, 10))
+    btn_frame = tk.Frame(dialog)  # Button area.
+    btn_frame.pack(pady=(0, 10))  # Layout.
 
-    btn_ok = tk.Button(btn_frame, text="OK", command=on_ok, width=10)
-    btn_ok.pack(side="left", padx=5)
+    tk.Button(btn_frame, text="OK", command=on_ok, width=10).pack(side="left", padx=5)
+    tk.Button(btn_frame, text="Cancel", command=on_cancel, width=10).pack(side="left", padx=5)
 
-    btn_cancel = tk.Button(btn_frame, text="Cancel", command=on_cancel, width=10)
-    btn_cancel.pack(side="left", padx=5)
+    dialog.transient(parent)  # Stay on top.
+    dialog.grab_set()  # Modal.
+    parent.wait_window(dialog)  # Wait until closed.
 
-    dialog.transient(root)
-    dialog.grab_set()
-    root.wait_window(dialog)
-    root.destroy()
-
-    return result["props"]
+    return result["props"]  # Return updated properties or None.
 
 
 # ---------------------------------------------------------------------
@@ -352,63 +333,37 @@ def edit_properties_dialog(initial_props):
 # ---------------------------------------------------------------------
 def parse_args():
     """Define and parse command-line arguments for the viewer."""
-    parser = argparse.ArgumentParser(
-        description="Interactive viewer for ROMS NetCDF 2D fields."
-    )
+    parser = argparse.ArgumentParser(description="Interactive viewer for ROMS NetCDF 2D fields.")
 
     parser.add_argument("ncfile", help="Path to NetCDF grid file")
 
-    parser.add_argument(
-        "--var",
-        default="mask_rho",
-        help="2D variable name to display (default: mask_rho)"
-    )
+    parser.add_argument("--var", default="mask_rho", help="2D variable name to display (default: mask_rho)")
+    parser.add_argument("--cmap", default="gray_r", help="Matplotlib colormap name (default: gray_r)")
 
-    parser.add_argument(
-        "--cmap",
-        default="gray_r",
-        help="Matplotlib colormap name (default: gray_r)"
-    )
+    parser.add_argument("--loglevel", default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+                        help="Logging level (default: INFO)")
 
-    parser.add_argument(
-        "--loglevel",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Logging level (default: INFO)"
-    )
+    parser.add_argument("--sources-geojson", default=None,
+                        help="Path to GeoJSON file with Lagrangian sources (lon/lat Points).")
 
-    parser.add_argument(
-        "--sources-geojson",
-        default=None,
-        help="Path to GeoJSON file with Lagrangian sources (lon/lat Points)."
-    )
+    parser.add_argument("--snap-sources-to-sea", action="store_true",
+                        help="Initial state: show sources snapped to nearest sea grid point.")
 
+    # NEW: rho-level sigma vector (comma-separated).
     parser.add_argument(
-        "--snap-sources-to-sea",
-        action="store_true",
-        help="Initial state: show sources snapped to nearest sea grid point."
-    )
-
-    # Vertical stretch vector (comma-separated)
-    parser.add_argument(
-        "--sw",
+        "--s_rho",
         type=str,
         default=None,
-        help=(
-            "Comma-separated vertical stretch (sigma) values, e.g.\n"
-            "--sw -1,-0.97,-0.93,...,0"
-        )
+        help="Comma-separated ROMS s_rho values (rho levels), e.g. --s_rho -0.975,-0.925,...,-0.025"
     )
 
-    # NEW: default output JSON path if file browser cannot be used
+    # Export fallback if no dialog (or user cancels).
     parser.add_argument(
         "--default-output-json",
         type=str,
         default=None,
-        help=(
-            "Default output JSON filename/path to use for export if the "
-            "file browser cannot be opened (e.g. no tkinter)."
-        )
+        help="Default output JSON path used if no file is chosen in the dialog."
     )
 
     return parser.parse_args()
@@ -418,54 +373,54 @@ def parse_args():
 # Main routine
 # ---------------------------------------------------------------------
 def main():
-    args = parse_args()
+    args = parse_args()  # Parse CLI.
 
-    logging.basicConfig(
-        level=getattr(logging, args.loglevel),
-        format="%(asctime)s [%(levelname)s] %(message)s"
-    )
+    logging.basicConfig(level=getattr(logging, args.loglevel),
+                        format="%(asctime)s [%(levelname)s] %(message)s")  # Setup logging.
 
-    # Parse --sw as comma-separated floats (if provided)
-    sw_vals = None
-    if args.sw is not None:
+    logging.info(f"Matplotlib backend: {matplotlib.get_backend()}")  # Report backend.
+    logging.info(f"Matplotlib version: {matplotlib.__version__}")  # Report version.
+
+    # Parse s_rho (comma-separated floats).
+    s_rho_vals = None
+    if args.s_rho is not None:
         try:
-            sw_vals = np.array(
-                [float(v.strip()) for v in args.sw.split(",") if v.strip() != ""],
-                dtype=float
-            )
-            if sw_vals.size == 0:
-                logging.warning("--sw provided but no valid numbers found.")
-                sw_vals = None
+            s_rho_vals = np.array([float(v.strip()) for v in args.s_rho.split(",") if v.strip() != ""], dtype=float)
+            if s_rho_vals.size == 0:
+                logging.warning("--s_rho provided but no valid numbers found.")
+                s_rho_vals = None
             else:
-                logging.info(f"Parsed {sw_vals.size} vertical stretch levels from --sw.")
+                logging.info(f"Parsed {s_rho_vals.size} rho-levels from --s_rho.")
         except Exception as e:
-            logging.error(f"Error parsing --sw values: {e}")
+            logging.error(f"Error parsing --s_rho values: {e}")
             sys.exit(1)
 
-    logging.info(f"Matplotlib version: {matplotlib.__version__}")
-    logging.info(f"Opening NetCDF file: {args.ncfile}")
+    logging.info(f"Opening NetCDF file: {args.ncfile}")  # Log input.
 
+    # Open NetCDF.
     try:
         nc = Dataset(args.ncfile, "r")
     except Exception as e:
         logging.error(f"Error opening NetCDF file: {e}")
         sys.exit(1)
 
+    # Validate variable.
     if args.var not in nc.variables:
         logging.error(f"Variable '{args.var}' not found in file.")
         logging.info("Available variables: " + ", ".join(nc.variables.keys()))
         nc.close()
         sys.exit(1)
 
+    # Read arrays.
     var = nc.variables[args.var][:]
     h = nc.variables["h"][:] if "h" in nc.variables else None
     lon_rho = nc.variables["lon_rho"][:] if "lon_rho" in nc.variables else None
     lat_rho = nc.variables["lat_rho"][:] if "lat_rho" in nc.variables else None
     mask_rho = nc.variables["mask_rho"][:] if "mask_rho" in nc.variables else None
 
-    nc.close()
+    nc.close()  # Close file.
 
-    data = np.array(var)
+    data = np.array(var)  # Ensure ndarray.
     if data.ndim != 2:
         logging.error(f"Variable '{args.var}' is not 2D (ndim={data.ndim}).")
         sys.exit(1)
@@ -473,9 +428,7 @@ def main():
     ny, nx = data.shape
     logging.info(f"{args.var} shape: (eta={ny}, xi={nx})")
 
-    # -----------------------------------------------------------------
-    # Load GeoJSON sources if requested
-    # -----------------------------------------------------------------
+    # Load GeoJSON sources (optional).
     sources_lon = None
     sources_lat = None
     gj = None
@@ -486,10 +439,9 @@ def main():
             logging.info(f"Loading particle sources from GeoJSON: {args.sources_geojson}")
             with open(args.sources_geojson, "r", encoding="utf-8") as f:
                 gj = json.load(f)
+
             feats = gj.get("features", [])
-            lons = []
-            lats = []
-            feature_indices = []
+            lons, lats, feature_indices = [], [], []
 
             for idx, feat in enumerate(feats):
                 geom = feat.get("geometry", {})
@@ -498,9 +450,8 @@ def main():
                 coords = geom.get("coordinates", None)
                 if not coords or len(coords) < 2:
                     continue
-                lon, lat = coords[0], coords[1]
-                lons.append(lon)
-                lats.append(lat)
+                lons.append(coords[0])
+                lats.append(coords[1])
                 feature_indices.append(idx)
 
             if lons:
@@ -509,20 +460,15 @@ def main():
                 logging.info(f"Loaded {len(sources_lon)} point sources from GeoJSON.")
             else:
                 logging.warning("No valid Point geometries found in GeoJSON.")
+
         except Exception as e:
             logging.error(f"Error reading GeoJSON file: {e}")
 
-    # -----------------------------------------------------------------
-    # Create figure and show base field
-    # -----------------------------------------------------------------
+    # Create figure.
     fig, ax = plt.subplots(figsize=(12, 8))
 
-    im = ax.imshow(
-        data,
-        origin="lower",
-        cmap=args.cmap,
-        interpolation="nearest"
-    )
+    # Display base field.
+    im = ax.imshow(data, origin="lower", cmap=args.cmap, interpolation="nearest")
     plt.colorbar(im, ax=ax, label=f"{args.var}")
 
     ax.set_title(f"{args.var} with bathymetry & sources (interactive)")
@@ -532,16 +478,11 @@ def main():
     ax.set_xlim(xmin_full, xmax_full)
     ax.set_ylim(ymin_full, ymax_full)
 
-    # -----------------------------------------------------------------
-    # Bathymetry contours
-    # -----------------------------------------------------------------
+    # Bathymetry contours.
     if h is not None:
         logging.info("Adding bathymetry contours from 'h'")
         h_data = np.array(h, dtype=float)
-        if mask_rho is not None:
-            h_masked = np.ma.masked_where(mask_rho < 0.5, h_data)
-        else:
-            h_masked = h_data
+        h_masked = np.ma.masked_where(mask_rho < 0.5, h_data) if mask_rho is not None else h_data
 
         finite_vals = h_masked[np.isfinite(h_masked)]
         if finite_vals.size > 0:
@@ -549,29 +490,19 @@ def main():
             vmax = float(np.nanmax(finite_vals))
             if vmax > vmin:
                 levels = np.linspace(vmin, vmax, 15)
-                cs = ax.contour(
-                    h_masked,
-                    levels=levels,
-                    colors="k",
-                    linewidths=0.3
-                )
+                cs = ax.contour(h_masked, levels=levels, colors="k", linewidths=0.3)
                 ax.clabel(cs, inline=True, fontsize=6, fmt="%.0f")
         else:
             logging.warning("No finite values in 'h' to contour.")
     else:
         logging.info("No 'h' variable found: skipping bathymetry contours.")
 
-    # -----------------------------------------------------------------
-    # Status bar coordinate readout
-    # -----------------------------------------------------------------
+    # Status bar.
     ax.format_coord = make_format_coord(data, lon_rho=lon_rho, lat_rho=lat_rho)
 
-    # -----------------------------------------------------------------
-    # Axes: lon/lat + xi/eta if available
-    # -----------------------------------------------------------------
+    # Axes: lon/lat + xi/eta if available.
     if lon_rho is not None and lat_rho is not None:
         logging.info("Configuring axes: bottom=lon, top=xi, left=lat, right=eta.")
-
         mid_j = ny // 2
         mid_i = nx // 2
 
@@ -579,8 +510,7 @@ def main():
         yticks = np.linspace(0, ny - 1, 6, dtype=int)
 
         ax.set_xticks(xticks)
-        lon_labels = [f"{lon_rho[mid_j, i]:.3f}" for i in xticks]
-        ax.set_xticklabels(lon_labels)
+        ax.set_xticklabels([f"{lon_rho[mid_j, i]:.3f}" for i in xticks])
         ax.set_xlabel("longitude (°E)")
 
         ax_top = ax.secondary_xaxis("top", functions=(lambda x: x, lambda x: x))
@@ -589,8 +519,7 @@ def main():
         ax_top.set_xlabel("xi index")
 
         ax.set_yticks(yticks)
-        lat_labels = [f"{lat_rho[j, mid_i]:.3f}" for j in yticks]
-        ax.set_yticklabels(lat_labels)
+        ax.set_yticklabels([f"{lat_rho[j, mid_i]:.3f}" for j in yticks])
         ax.set_ylabel("latitude (°N)")
 
         ax_right = ax.secondary_yaxis("right", functions=(lambda y: y, lambda y: y))
@@ -598,18 +527,13 @@ def main():
         ax_right.set_yticklabels([str(j) for j in yticks])
         ax_right.set_ylabel("eta index")
     else:
-        logging.info(
-            "lon_rho/lat_rho not found: using indices on both axes as fallback."
-        )
+        logging.info("lon_rho/lat_rho not found: using indices on both axes as fallback.")
         ax.set_xlabel("xi index")
         ax.set_ylabel("eta index")
 
-    # -----------------------------------------------------------------
-    # Info overlay text (bottom-left)
-    # -----------------------------------------------------------------
+    # Info overlay.
     info_text = ax.text(
-        0.01, 0.01,
-        "",
+        0.01, 0.01, "",
         transform=ax.transAxes,
         fontsize=8,
         va="bottom",
@@ -619,9 +543,15 @@ def main():
         visible=False,
     )
 
-    # -----------------------------------------------------------------
-    # State dict shared across callbacks
-    # -----------------------------------------------------------------
+    # Get Tk parent window from Matplotlib (TkAgg).
+    tk_parent = None
+    if TK_AVAILABLE and "TkAgg" in matplotlib.get_backend():
+        try:
+            tk_parent = fig.canvas.manager.window  # Tk window hosting the figure.
+        except Exception:
+            tk_parent = None
+
+    # Shared state.
     state = {
         "scatter": None,
         "use_snapped": False,
@@ -635,19 +565,16 @@ def main():
         "info_text": info_text,
         "lon_rho": lon_rho,
         "lat_rho": lat_rho,
-        "sw": sw_vals,
+        "s_rho": s_rho_vals,
         "h": h,
         "default_output_json": args.default_output_json,
+        "tk_parent": tk_parent,
     }
 
-    # -----------------------------------------------------------------
-    # Overlay particle sources (if any)
-    # -----------------------------------------------------------------
+    # Overlay sources.
     if sources_lon is not None and sources_lat is not None:
         if lon_rho is None or lat_rho is None:
-            logging.warning(
-                "Sources loaded but lon_rho/lat_rho missing: cannot map to grid."
-            )
+            logging.warning("Sources loaded but lon_rho/lat_rho missing: cannot map to grid.")
         else:
             logging.info("Mapping sources (lon/lat) to grid indices.")
             lonlat_to_ij = build_lonlat_index_mappers(lon_rho, lat_rho)
@@ -658,6 +585,7 @@ def main():
                 xi, eta = lonlat_to_ij(lon, lat)
                 xi_raw.append(xi)
                 eta_raw.append(eta)
+
             xi_raw = np.array(xi_raw, dtype=float)
             eta_raw = np.array(eta_raw, dtype=float)
 
@@ -673,16 +601,13 @@ def main():
                     snapped_y.append(sy)
                 xi_snapped = np.array(snapped_x, dtype=float)
                 eta_snapped = np.array(snapped_y, dtype=float)
-            else:
-                logging.warning("mask_rho not available: cannot compute snapped positions.")
 
             use_snapped = bool(args.snap_sources_to_sea and xi_snapped is not None)
             xi_plot = xi_snapped if use_snapped and xi_snapped is not None else xi_raw
             eta_plot = eta_snapped if use_snapped and eta_snapped is not None else eta_raw
 
             scatter = ax.scatter(
-                xi_plot,
-                eta_plot,
+                xi_plot, eta_plot,
                 facecolors="none",
                 edgecolors="red",
                 s=40,
@@ -700,78 +625,58 @@ def main():
             state["xi_snapped"] = xi_snapped
             state["eta_snapped"] = eta_snapped
 
-            # ---------------------------------------------------------
-            # Snap-to-sea checkbox
-            # ---------------------------------------------------------
+            # Snap-to-sea checkbox.
             if xi_snapped is not None:
                 ax_check = plt.axes([0.02, 0.80, 0.16, 0.10])
-                check = CheckButtons(
-                    ax_check,
-                    labels=["Snap to sea"],
-                    actives=[state["use_snapped"]]
-                )
+                check = CheckButtons(ax_check, labels=["Snap to sea"], actives=[state["use_snapped"]])
 
-                def on_check(label):
+                def on_check(_label):
                     state["use_snapped"] = not state["use_snapped"]
                     use = state["use_snapped"]
+
                     if use and state["xi_snapped"] is None:
-                        logging.warning(
-                            "Snap requested but snapped positions not available."
-                        )
+                        logging.warning("Snap requested but snapped positions not available.")
                         state["use_snapped"] = False
                         return
 
                     if use and state["xi_snapped"] is not None:
-                        xs = state["xi_snapped"]
-                        ys = state["eta_snapped"]
+                        xs, ys = state["xi_snapped"], state["eta_snapped"]
                     else:
-                        xs = state["xi_raw"]
-                        ys = state["eta_raw"]
+                        xs, ys = state["xi_raw"], state["eta_raw"]
 
-                    offsets = np.column_stack([xs, ys])
-                    state["scatter"].set_offsets(offsets)
+                    state["scatter"].set_offsets(np.column_stack([xs, ys]))
                     ax.figure.canvas.draw_idle()
 
                 check.on_clicked(on_check)
 
-            # ---------------------------------------------------------
-            # Export JSON button (with file browser + fallback)
-            # ---------------------------------------------------------
+            # Export button.
             if state["gj"] is not None and state["feature_indices"] is not None:
                 ax_button = plt.axes([0.02, 0.70, 0.16, 0.06])
                 btn = Button(ax_button, "Export JSON")
 
-                def on_export(event):
-                    """
-                    Export modified GeoJSON/JSON with i, j (and optional k).
-
-                    Priority:
-                    - try file browser if tkinter is available;
-                    - on failure or if tkinter missing, use
-                      --default-output-json if provided;
-                    - otherwise, abort with an error.
-                    """
-                    gj_obj = state["gj"]
+                def on_export(_event):
+                    gj_src = state["gj"]
                     feat_idx = state["feature_indices"]
                     default_output = state.get("default_output_json")
+                    parent = state.get("tk_parent")
 
-                    if gj_obj is None or feat_idx is None:
+                    if gj_src is None or feat_idx is None:
                         logging.error("No GeoJSON state available; cannot export.")
                         return
 
-                    # Use snapped or raw coordinates based on current state
+                    # Deep copy so repeated exports don’t keep mutating in-memory object.
+                    gj_obj = json.loads(json.dumps(gj_src))
+
                     use = state["use_snapped"]
                     if use and state["xi_snapped"] is not None:
-                        xs = state["xi_snapped"]
-                        ys = state["eta_snapped"]
+                        xs, ys = state["xi_snapped"], state["eta_snapped"]
                     else:
-                        xs = state["xi_raw"]
-                        ys = state["eta_raw"]
+                        xs, ys = state["xi_raw"], state["eta_raw"]
 
-                    sw = state.get("sw", None)
+                    s_rho = state.get("s_rho", None)
                     h_arr = state.get("h", None)
 
-                    # Update each feature's properties with i, j, and possibly k
+                    # Update features.
                     for idx, x, y in zip(feat_idx, xs, ys):
                         feat = gj_obj["features"][idx]
                         props = feat.setdefault("properties", {})
@@ -781,113 +686,88 @@ def main():
                         props["i"] = i_idx
                         props["j"] = j_idx
 
-                        if sw is not None and h_arr is not None and "depth" in props:
+                        # depth -> k using s_rho (rho-level).
+                        if s_rho is not None and h_arr is not None and "depth" in props:
                             try:
-                                depth_val = float(props["depth"])  # m, positive down
-                                source_id = props["id"]
+                                depth_val = float(props.get("depth"))  # meters, positive down
                                 ny_h, nx_h = h_arr.shape
-                                if 0 <= j_idx < ny_h and 0 <= i_idx < nx_h:
-                                    H = float(h_arr[j_idx, i_idx])
-                                    if H > 0.0:
-                                        s_target = 0
-                                        k_idx = 0
-                                        if depth_val < H:
-                                            s_target = -depth_val / H
-                                            k_idx = int(np.argmin(np.abs(sw - s_target)))-1
+                                if not (0 <= j_idx < ny_h and 0 <= i_idx < nx_h):
+                                    logging.warning(f"(j,i)=({j_idx},{i_idx}) out of h bounds; cannot compute k.")
+                                    continue
 
-                                        props["k"] = k_idx
+                                H = float(h_arr[j_idx, i_idx])
+                                if not np.isfinite(H) or H <= 0.0:
+                                    logging.warning(f"h({j_idx},{i_idx}) invalid (H={H}); cannot compute k.")
+                                    continue
 
-                                        logging.debug(
-                                            f"Source {source_id}: depth={depth_val}, "
-                                            f"H={H}, s_target={s_target}, k={k_idx}"
-                                        )
-                                    else:
-                                        logging.warning(
-                                            f"h({j_idx},{i_idx}) <= 0 at Source {source_id}: "
-                                            "cannot compute k."
-                                        )
-                                else:
-                                    logging.warning(
-                                        f"(j,i)=({j_idx},{i_idx}) out of h bounds for Source {source_id}"
-                                    )
-                            except Exception as e:
-                                logging.warning(
-                                    f"Could not convert depth to k for feature {idx}: {e}"
+                                s_target = -depth_val / H
+                                s_target = float(np.clip(s_target, -1.0, 0.0))
+
+                                s_rho_arr = np.asarray(s_rho, dtype=float)
+                                k = int(np.argmin(np.abs(s_rho_arr - s_target)))
+                                props["k"] = k
+
+                                source_id = props.get("id", f"feature_{idx}")
+                                logging.debug(
+                                    f"Source {source_id}: depth={depth_val}, H={H}, "
+                                    f"s_target={s_target:.4f}, k={k}, s_rho[k]={s_rho_arr[k]:.4f}"
                                 )
 
-                    # Build default name for GUI dialog
+                            except Exception as e:
+                                logging.warning(f"Could not convert depth to k for feature {idx}: {e}")
+
+                    # Default output name for dialog.
                     base_out = "sources_with_indices"
                     if state["sources_path"] is not None:
                         in_path = state["sources_path"]
-                        base_name = os.path.splitext(os.path.basename(in_path))[0]
-                        base_out = base_name
+                        base_out = os.path.splitext(os.path.basename(in_path))[0]
                     suffix = "_snapped" if use else "_indices"
                     default_name = f"{base_out}{suffix}.json"
-                    initial_dir = (
-                        os.path.dirname(state["sources_path"])
-                        if state["sources_path"] is not None
-                        else "."
-                    )
+                    initial_dir = os.path.dirname(state["sources_path"]) if state["sources_path"] else "."
 
                     file_path = None
 
-                    # Try file browser if tkinter is available
-                    if TK_AVAILABLE:
+                    # File dialog if possible (TkAgg).
+                    if TK_AVAILABLE and parent is not None:
                         try:
-                            root = tk.Tk()
-                            root.withdraw()
                             file_path = filedialog.asksaveasfilename(
+                                parent=parent,
                                 defaultextension=".json",
                                 initialfile=default_name,
                                 initialdir=initial_dir,
-                                filetypes=[("JSON files", "*.json"),
-                                           ("All files", "*.*")]
+                                filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
                             )
-                            root.destroy()
                         except Exception as e:
                             logging.error(f"Error opening file dialog: {e}")
                             file_path = None
-                    else:
-                        logging.warning(
-                            "tkinter is not available: cannot open file browser."
-                        )
 
-                    # If user cancelled dialog or dialog failed, fallback to default_output_json if given
+                    # Fallback output.
                     if not file_path:
                         if default_output is not None:
                             file_path = default_output
-                            logging.info(
-                                f"Using --default-output-json path for export: {file_path}"
-                            )
+                            logging.info(f"Using --default-output-json for export: {file_path}")
                         else:
-                            logging.error(
-                                "No file chosen and no --default-output-json provided; "
-                                "export aborted."
-                            )
+                            logging.error("No file chosen and no --default-output-json provided; export aborted.")
                             return
 
-                    # Ensure .json extension
                     if not file_path.lower().endswith(".json"):
-                        file_path = file_path + ".json"
+                        file_path += ".json"
 
-                    # Write JSON
+                    # Write JSON.
                     try:
                         with open(file_path, "w", encoding="utf-8") as f_out:
                             json.dump(gj_obj, f_out, indent=2, ensure_ascii=False)
                         logging.info(
                             f"Exported modified JSON with i/j"
-                            f"{' and k' if sw is not None else ''} to: {file_path}"
+                            f"{' and k' if s_rho is not None else ''} to: {file_path}"
                         )
                     except Exception as e:
                         logging.error(f"Error writing JSON file: {e}")
 
                 btn.on_clicked(on_export)
 
-            # ---------------------------------------------------------
-            # Pick handler: click on source
-            # ---------------------------------------------------------
+            # Pick handler.
             def on_pick(event):
-                """Show info overlay and optionally open JSON editor."""
                 if event.artist is not state["scatter"]:
                     return
 
@@ -898,9 +778,7 @@ def main():
                 src_idx = int(ind[0])
                 gj_obj = state["gj"]
                 feat_idx = state["feature_indices"]
-                if gj_obj is None or feat_idx is None:
-                    return
-                if src_idx >= len(feat_idx):
+                if gj_obj is None or feat_idx is None or src_idx >= len(feat_idx):
                     return
 
                 use = state["use_snapped"]
@@ -924,45 +802,38 @@ def main():
                 feat = gj_obj["features"][feat_idx[src_idx]]
                 props = feat.setdefault("properties", {})
 
-                lines = [
-                    f"Source #{src_idx}",
-                    f"i (xi) = {ix}, j (eta) = {iy}",
-                ]
+                lines = [f"Source #{src_idx}", f"i (xi) = {ix}, j (eta) = {iy}"]
                 if lon is not None and lat is not None:
                     lines.append(f"lon = {lon:.5f}, lat = {lat:.5f}")
                 if props:
                     lines.append("properties:")
-                    max_props = 6
-                    for k, v in list(props.items())[:max_props]:
+                    for k, v in list(props.items())[:6]:
                         lines.append(f"  {k} = {v}")
-                    if len(props) > max_props:
+                    if len(props) > 6:
                         lines.append("  ...")
 
-                info_txt = "\n".join(lines)
-                state["info_text"].set_text(info_txt)
+                state["info_text"].set_text("\n".join(lines))
                 state["info_text"].set_visible(True)
                 ax.figure.canvas.draw_idle()
 
-                if TK_AVAILABLE:
+                # Open editor dialog if possible.
+                parent = state.get("tk_parent")
+                if TK_AVAILABLE and parent is not None:
                     logging.info(f"Editing properties for source #{src_idx}")
-                    new_props = edit_properties_dialog(props)
+                    new_props = edit_properties_dialog(parent, props)
                     if new_props is not None:
                         feat["properties"] = new_props
                         logging.info(f"Updated properties for source #{src_idx}")
                 else:
-                    logging.warning(
-                        "tkinter not available: skipping edit dialog; overlay updated only."
-                    )
+                    logging.warning("No Tk parent window available: skipping edit dialog.")
 
             fig.canvas.mpl_connect("pick_event", on_pick)
 
-    # -----------------------------------------------------------------
-    # Scroll + rectangle zoom
-    # -----------------------------------------------------------------
+    # Scroll zoom.
     fig.canvas.mpl_connect("scroll_event", lambda event: scroll_zoom(event, ax))
 
+    # Rectangle zoom.
     if use_new_rectangle_selector_api():
-        logging.info("Using new RectangleSelector API (Matplotlib >= 3.8)")
         RectangleSelector(
             ax,
             lambda eclick, erelease: zoom_rect(eclick, erelease, ax),
@@ -970,7 +841,6 @@ def main():
             props=dict(facecolor="none", edgecolor="red", linewidth=1),
         )
     else:
-        logging.info("Using legacy RectangleSelector API (Matplotlib < 3.8)")
         RectangleSelector(
             ax,
             lambda eclick, erelease: zoom_rect(eclick, erelease, ax),
@@ -983,14 +853,8 @@ def main():
             interactive=True
         )
 
-    # -----------------------------------------------------------------
-    # Keyboard shortcuts
-    # -----------------------------------------------------------------
-    key_handler = make_key_handler(
-        ax,
-        data_shape=data.shape,
-        full_extent=(xmin_full, xmax_full, ymin_full, ymax_full)
-    )
+    # Keyboard shortcuts.
+    key_handler = make_key_handler(ax, full_extent=(xmin_full, xmax_full, ymin_full, ymax_full))
     fig.canvas.mpl_connect("key_press_event", key_handler)
 
     plt.tight_layout()
@@ -999,3 +863,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

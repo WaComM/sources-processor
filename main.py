@@ -784,25 +784,31 @@ def main():
                         if sw is not None and h_arr is not None and "depth" in props:
                             try:
                                 depth_val = float(props["depth"])  # m, positive down
+                                source_id = props["id"]
                                 ny_h, nx_h = h_arr.shape
                                 if 0 <= j_idx < ny_h and 0 <= i_idx < nx_h:
                                     H = float(h_arr[j_idx, i_idx])
                                     if H > 0.0:
-                                        s_target = -depth_val / H
-                                        k_idx = int(np.argmin(np.abs(sw - s_target)))
+                                        s_target = 0
+                                        k_idx = 0
+                                        if depth_val < H:
+                                            s_target = -depth_val / H
+                                            k_idx = int(np.argmin(np.abs(sw - s_target)))-1
+
                                         props["k"] = k_idx
+
                                         logging.debug(
-                                            f"Feature {idx}: depth={depth_val}, "
+                                            f"Source {source_id}: depth={depth_val}, "
                                             f"H={H}, s_target={s_target}, k={k_idx}"
                                         )
                                     else:
                                         logging.warning(
-                                            f"h({j_idx},{i_idx}) <= 0 at feature {idx}: "
+                                            f"h({j_idx},{i_idx}) <= 0 at Source {source_id}: "
                                             "cannot compute k."
                                         )
                                 else:
                                     logging.warning(
-                                        f"(j,i)=({j_idx},{i_idx}) out of h bounds for feature {idx}"
+                                        f"(j,i)=({j_idx},{i_idx}) out of h bounds for Source {source_id}"
                                     )
                             except Exception as e:
                                 logging.warning(

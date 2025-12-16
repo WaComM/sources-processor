@@ -686,6 +686,12 @@ def main():
                         props["i"] = i_idx
                         props["j"] = j_idx
 
+                        props["start"] = -1.0
+                        props["end"] = -1.0
+                        props["mode"] = 1
+                        props["particlesPerHour"] = 100
+                        props["depth"] = 0.0
+
                         # depth -> k using s_rho (rho-level).
                         if s_rho is not None and h_arr is not None and "depth" in props:
                             try:
@@ -715,6 +721,8 @@ def main():
 
                             except Exception as e:
                                 logging.warning(f"Could not convert depth to k for feature {idx}: {e}")
+                        else:
+                            props["k"] = 0
 
                     # Default output name for dialog.
                     base_out = "sources_with_indices"
@@ -863,4 +871,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

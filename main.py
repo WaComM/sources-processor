@@ -1,875 +1,1154 @@
 #!/usr/bin/env python3
-# Use the system's default Python 3 interpreter to run this script.
-
 """
-Interactive viewer for 2D fields in a ROMS-style NetCDF grid.
+Qt (PySide6 / PyQt5) interactive viewer for ROMS-style NetCDF grids.
 
-Features:
-- Visualize mask_rho (default) or any 2D variable.
-- Overlays bathymetry contours (h) if available.
-- Overlays Lagrangian particle sources from a GeoJSON file (lon/lat).
-- Optional snapping of sources to nearest sea grid point (mask_rho == 1),
-  controllable both via CLI and via a GUI checkbox.
-- Export modified JSON/GeoJSON (with i/j indices and optional k vertical index)
-  via a GUI button and file browser. k is computed from depth using --s_rho.
-- If the file browser cannot be opened (no tkinter / error), and
-  --default-output-json is provided, export will write to that path instead.
-- Click on a source to:
-    * see its info in an overlay on the plot (index, i/j, lon/lat, properties)
-    * edit its properties via a JSON dialog (if tkinter is available).
-- Scroll wheel zoom.
-- Rectangle zoom with mouse drag.
-- Keyboard shortcuts:
-    r : reset view
-    + : zoom in (centered)
-    - : zoom out (centered)
-- Status bar shows indices, lon/lat (if available), and value.
-- Axes:
-    bottom : longitude (°E)
-    top    : xi index
-    left   : latitude (°N)
-    right  : eta index
+Update requested:
+- k is NEGATIVE: 0 (surface) ... -s_w (bottom)
+- k is derived from the ROMS s_w vector (w-levels), provided either:
+    * via CLI: --s_w "-1.0,-0.9,...,0.0"   (or any order; we'll sort by value)
+    * via GUI menu: Load s_w CSV...
+- If no s_w is provided: k defaults to 0 (surface)
+- When s_w is loaded from CSV: recompute k for ALL sources immediately
+- Existing behavior preserved:
+  - When GeoJSON is loaded: compute i,j,k from lon,lat,depth
+  - When snapping toggled: recompute i,j,k
+  - Edit dialog: recompute k live when depth changes; buttons Surface/Bottom
 
-Example of --s_rho usage:
---s_rho ="-0.983333333333333,-0.95,-0.916666666666667,-0.883333333333333,-0.85,-0.816666666666667,-0.783333333333333,-0.75,-0.716666666666667,-0.683333333333333,-0.65,-0.616666666666667,-0.583333333333333,-0.55,-0.516666666666667,-0.483333333333333,-0.45,-0.416666666666667,-0.383333333333333,-0.35,-0.316666666666667,-0.283333333333333,-0.25,-0.216666666666667,-0.183333333333333,-0.15,-0.116666666666667,-0.0833333333333333,-0.05,-0.0166666666666667"
+Notes about k range:
+- If len(s_w)=N, indices are 0..N-1 and we return k = -idx
+  so k ranges 0 .. -(N-1)
 """
 
-#!/usr/bin/env python3
-"""
-Interactive viewer for 2D fields in a ROMS-style NetCDF grid.
-
-IMPORTANT macOS/Python 3.13 stability note:
-- The Matplotlib "MacOSX" backend + tkinter usage is a frequent crash source.
-- This script forces the "TkAgg" backend when tkinter is available.
-  (Must be done BEFORE importing matplotlib.pyplot.)
-"""
+import sys
+import os
+import json
+import argparse
+import logging
 
 # ------------------------------
-# Standard library imports
-# ------------------------------
-import sys  # Exit, argv.
-import os  # Paths, environment.
-import argparse  # CLI parsing.
-import logging  # Logging.
-import json  # GeoJSON read/write.
-
-# ------------------------------
-# Optional tkinter imports
+# Qt imports (PySide6 preferred)
 # ------------------------------
 try:
-    import tkinter as tk  # GUI toolkit.
-    from tkinter import filedialog, messagebox  # Dialog helpers.
-    TK_AVAILABLE = True  # Flag: tkinter is usable.
+    from PySide6 import QtCore, QtGui, QtWidgets
+    QT_LIB = "PySide6"
 except Exception:
-    TK_AVAILABLE = False  # Flag: no tkinter.
-    tk = None
-    filedialog = None
-    messagebox = None
+    from PyQt5 import QtCore, QtGui, QtWidgets
+    QT_LIB = "PyQt5"
 
 # ------------------------------
-# Matplotlib backend selection (MUST be before pyplot import)
+# Matplotlib backend
 # ------------------------------
-import matplotlib  # Matplotlib core.
+import matplotlib
+if not os.environ.get("MPLBACKEND"):
+    matplotlib.use("QtAgg", force=True)
 
-# Force TkAgg when tkinter exists; otherwise keep default (or use Agg headless).
-if TK_AVAILABLE:
-    # If user explicitly sets MPLBACKEND, respect it; else force TkAgg.
-    if not os.environ.get("MPLBACKEND"):
-        matplotlib.use("TkAgg", force=True)
-
-# ------------------------------
-# Third-party imports
-# ------------------------------
-import numpy as np  # Arrays.
-import matplotlib.pyplot as plt  # Pyplot (after backend chosen).
-from matplotlib.widgets import RectangleSelector, Button, CheckButtons  # Widgets.
-from netCDF4 import Dataset  # NetCDF.
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qtagg import (
+    FigureCanvasQTAgg as FigureCanvas,
+    NavigationToolbar2QT as NavigationToolbar,
+)
+from netCDF4 import Dataset
 
 
-# ---------------------------------------------------------------------
-# Zoom helpers
-# ---------------------------------------------------------------------
-def apply_zoom(ax, x_center, y_center, scale_factor):
-    """Zoom axes around (x_center, y_center) by scale_factor."""
-    xmin, xmax = ax.get_xlim()  # Current x limits.
-    ymin, ymax = ax.get_ylim()  # Current y limits.
-
-    if xmax == xmin or ymax == ymin:
-        return  # Avoid division by zero.
-
-    width = (xmax - xmin) * scale_factor  # New width.
-    height = (ymax - ymin) * scale_factor  # New height.
-
-    ax.set_xlim([
-        x_center - width * (x_center - xmin) / (xmax - xmin),
-        x_center + width * (xmax - x_center) / (xmax - xmin)
-    ])  # Update x range.
-
-    ax.set_ylim([
-        y_center - height * (y_center - ymin) / (ymax - ymin),
-        y_center + height * (ymax - y_center) / (ymax - ymin)
-    ])  # Update y range.
-
-    ax.figure.canvas.draw_idle()  # Redraw.
-
-
-def scroll_zoom(event, ax):
-    """Mouse scroll wheel zoom."""
-    if event.inaxes != ax or event.xdata is None or event.ydata is None:
-        return  # Ignore scrolls outside axes.
-
-    if event.button == "up":
-        scale = 1 / 1.2  # Zoom in.
-    elif event.button == "down":
-        scale = 1.2  # Zoom out.
-    else:
-        return
-
-    apply_zoom(ax, event.xdata, event.ydata, scale)  # Apply zoom at cursor.
+# ============================================================
+# Helpers
+# ============================================================
+def parse_floats_from_any_text(text: str):
+    """
+    Parse floats from:
+      - comma-separated line
+      - whitespace-separated
+      - CSV file content (commas/newlines)
+    """
+    if text is None:
+        return None
+    # Normalize separators to spaces, then split
+    for ch in [",", ";", "\t", "\r", "\n"]:
+        text = text.replace(ch, " ")
+    parts = [p.strip() for p in text.split(" ") if p.strip() != ""]
+    if not parts:
+        return None
+    out = []
+    for p in parts:
+        try:
+            out.append(float(p))
+        except Exception:
+            pass
+    return np.array(out, dtype=float) if out else None
 
 
-def zoom_rect(eclick, erelease, ax):
-    """Rectangle zoom using drag."""
-    if eclick.xdata is None or erelease.xdata is None:
-        return  # Ignore invalid drag.
-
-    x1, y1 = eclick.xdata, eclick.ydata  # Start.
-    x2, y2 = erelease.xdata, erelease.ydata  # End.
-
-    ax.set_xlim(min(x1, x2), max(x1, x2))  # Set x selection.
-    ax.set_ylim(min(y1, y2), max(y1, y2))  # Set y selection.
-    ax.figure.canvas.draw_idle()  # Redraw.
-
-
-# ---------------------------------------------------------------------
-# Event handlers
-# ---------------------------------------------------------------------
-def make_key_handler(ax, full_extent):
-    """Return keypress handler with access to full extent."""
-    xmin_full, xmax_full, ymin_full, ymax_full = full_extent  # Full bounds.
-
-    def on_key(event):
-        if event.inaxes not in (ax, None):
-            return  # Ignore keys not for our figure.
-
-        key = event.key  # Key pressed.
-        logging.debug(f"Key pressed: {key}")
-
-        if key == "r":
-            ax.set_xlim(xmin_full, xmax_full)  # Reset x.
-            ax.set_ylim(ymin_full, ymax_full)  # Reset y.
-            ax.figure.canvas.draw_idle()  # Redraw.
-
-        elif key == "+":
-            cur_xmin, cur_xmax = ax.get_xlim()  # Current x.
-            cur_ymin, cur_ymax = ax.get_ylim()  # Current y.
-            cx = 0.5 * (cur_xmin + cur_xmax)  # Center x.
-            cy = 0.5 * (cur_ymin + cur_ymax)  # Center y.
-            apply_zoom(ax, cx, cy, 1 / 1.2)  # Zoom in.
-
-        elif key == "-":
-            cur_xmin, cur_xmax = ax.get_xlim()
-            cur_ymin, cur_ymax = ax.get_ylim()
-            cx = 0.5 * (cur_xmin + cur_xmax)
-            cy = 0.5 * (cur_ymin + cur_ymax)
-            apply_zoom(ax, cx, cy, 1.2)  # Zoom out.
-
-    return on_key
+def parse_s_w(s: str):
+    """
+    Parse s_w vector from CLI string.
+    We accept any order and sort ascending by value (typically -1..0).
+    """
+    arr = parse_floats_from_any_text(s)
+    if arr is None or arr.size == 0:
+        return None
+    arr = np.asarray(arr, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return None
+    # Sort by value: bottom ~ -1, surface ~ 0
+    arr = np.sort(arr)
+    return arr
 
 
-def make_format_coord(data, lon_rho=None, lat_rho=None):
-    """Custom coordinate formatter showing indices, value and lon/lat if available."""
-    ny, nx = data.shape  # Data size.
+def snap_to_nearest_sea(xi, eta, mask, rmax=50):
+    ny, nx = mask.shape
+    i0, j0 = int(round(xi)), int(round(eta))
+    i0 = int(np.clip(i0, 0, nx - 1))
+    j0 = int(np.clip(j0, 0, ny - 1))
 
-    def format_coord(x, y):
-        col = int(round(x))  # xi.
-        row = int(round(y))  # eta.
-        if 0 <= col < nx and 0 <= row < ny:
-            z = data[row, col]  # Value.
-            if lon_rho is not None and lat_rho is not None:
-                lon = lon_rho[row, col]
-                lat = lat_rho[row, col]
-                return f"xi={col:d}, eta={row:d}, lon={lon:.5f}, lat={lat:.5f}, value={z:.3f}"
-            return f"xi={col:d}, eta={row:d}, value={z:.3f}"
-        return f"x={x:.2f}, y={y:.2f}"
+    if mask[j0, i0] >= 0.5:
+        return float(i0), float(j0)
 
-    return format_coord
-
-
-# ---------------------------------------------------------------------
-# Matplotlib version helper
-# ---------------------------------------------------------------------
-def use_new_rectangle_selector_api():
-    """Return True if Matplotlib version is >= 3.8 (new RectangleSelector API)."""
-    ver = matplotlib.__version__  # Version string.
-    parts = ver.split(".")  # Split.
-    try:
-        major = int(parts[0])  # Major.
-        minor = int(parts[1]) if len(parts) > 1 else 0  # Minor.
-    except ValueError:
-        return True  # Default to new API if parsing fails.
-    return (major > 3) or (major == 3 and minor >= 8)
-
-
-# ---------------------------------------------------------------------
-# Lon/lat -> grid index mapping (approx)
-# ---------------------------------------------------------------------
-def build_lonlat_index_mappers(lon_rho, lat_rho):
-    """Approximate (lon,lat)->(xi,eta) using 1D interpolation on mid row/col."""
-    ny, nx = lon_rho.shape  # Grid size.
-
-    j_mid = ny // 2  # Mid row.
-    lon_mid = lon_rho[j_mid, :]  # Lon along mid row.
-    xi_idx = np.arange(nx)  # Xi indices.
-    lon_sort_idx = np.argsort(lon_mid)  # Sorting indices.
-    lon_sorted = lon_mid[lon_sort_idx]  # Sorted lon.
-    xi_sorted = xi_idx[lon_sort_idx]  # Xi aligned with sorted lon.
-
-    i_mid = nx // 2  # Mid col.
-    lat_mid = lat_rho[:, i_mid]  # Lat along mid col.
-    eta_idx = np.arange(ny)  # Eta indices.
-    lat_sort_idx = np.argsort(lat_mid)  # Sorting indices.
-    lat_sorted = lat_mid[lat_sort_idx]  # Sorted lat.
-    eta_sorted = eta_idx[lat_sort_idx]  # Eta aligned.
-
-    def lonlat_to_ij(lon, lat):
-        xi = np.interp(lon, lon_sorted, xi_sorted, left=xi_sorted[0], right=xi_sorted[-1])
-        eta = np.interp(lat, lat_sorted, eta_sorted, left=eta_sorted[0], right=eta_sorted[-1])
-        return xi, eta
-
-    return lonlat_to_ij
-
-
-# ---------------------------------------------------------------------
-# Snap sources to nearest sea point
-# ---------------------------------------------------------------------
-def snap_to_nearest_sea(xi, eta, mask_rho, max_radius=50):
-    """Snap (xi,eta) to nearest sea (mask_rho>=0.5) within max_radius."""
-    ny, nx = mask_rho.shape  # Shape.
-
-    i0 = int(round(xi))  # Start i.
-    j0 = int(round(eta))  # Start j.
-
-    i0 = max(0, min(nx - 1, i0))  # Clamp i.
-    j0 = max(0, min(ny - 1, j0))  # Clamp j.
-
-    if mask_rho[j0, i0] >= 0.5:
-        return float(i0), float(j0)  # Already sea.
-
-    for r in range(1, max_radius + 1):
+    for r in range(1, rmax + 1):
         i_min = max(0, i0 - r)
         i_max = min(nx - 1, i0 + r)
         j_min = max(0, j0 - r)
         j_max = min(ny - 1, j0 + r)
 
-        submask = mask_rho[j_min:j_max + 1, i_min:i_max + 1]
-        sea = submask >= 0.5
+        sub = mask[j_min : j_max + 1, i_min : i_max + 1]
+        sea = sub >= 0.5
         if not np.any(sea):
             continue
 
-        jj_sub, ii_sub = np.where(sea)
-        ii_global = i_min + ii_sub
-        jj_global = j_min + jj_sub
+        jj, ii = np.where(sea)
+        ii = ii + i_min
+        jj = jj + j_min
+        dx = ii.astype(float) - xi
+        dy = jj.astype(float) - eta
+        k = int(np.argmin(dx * dx + dy * dy))
+        return float(ii[k]), float(jj[k])
 
-        dx = ii_global.astype(float) - xi
-        dy = jj_global.astype(float) - eta
-        dist2 = dx * dx + dy * dy
-
-        k = int(np.argmin(dist2))
-        return float(ii_global[k]), float(jj_global[k])
-
-    logging.warning(
-        f"No sea point found within radius {max_radius} for source at "
-        f"(xi={xi:.2f}, eta={eta:.2f}). Keeping original position."
-    )
     return float(xi), float(eta)
 
 
-# ---------------------------------------------------------------------
-# Tk-based dialog for editing properties (uses Matplotlib Tk window as parent)
-# ---------------------------------------------------------------------
-def edit_properties_dialog(parent, initial_props):
-    """Open a modal dialog to edit a dict as JSON; returns dict or None."""
-    if not TK_AVAILABLE or parent is None:
-        logging.warning("tkinter not available (or no parent): cannot open edit dialog.")
-        return None
-
-    dialog = tk.Toplevel(parent)  # Child window.
-    dialog.title("Edit source properties")  # Title.
-
-    text = tk.Text(dialog, width=60, height=20)  # JSON editor.
-    text.pack(padx=10, pady=10, fill="both", expand=True)  # Layout.
-    text.insert("1.0", json.dumps(initial_props, indent=2))  # Initial JSON.
-
-    result = {"props": None}  # Store result.
-
-    def on_ok():
-        content = text.get("1.0", "end-1c")  # Get text.
-        try:
-            result["props"] = json.loads(content)  # Parse JSON.
-        except Exception as e:
-            messagebox.showerror("Invalid JSON", f"Could not parse properties as JSON:\n{e}", parent=dialog)
-            return
-        dialog.destroy()  # Close dialog.
-
-    def on_cancel():
-        dialog.destroy()  # Close without saving.
-
-    btn_frame = tk.Frame(dialog)  # Button area.
-    btn_frame.pack(pady=(0, 10))  # Layout.
-
-    tk.Button(btn_frame, text="OK", command=on_ok, width=10).pack(side="left", padx=5)
-    tk.Button(btn_frame, text="Cancel", command=on_cancel, width=10).pack(side="left", padx=5)
-
-    dialog.transient(parent)  # Stay on top.
-    dialog.grab_set()  # Modal.
-    parent.wait_window(dialog)  # Wait until closed.
-
-    return result["props"]  # Return updated properties or None.
-
-
-# ---------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------
-def parse_args():
-    """Define and parse command-line arguments for the viewer."""
-    parser = argparse.ArgumentParser(description="Interactive viewer for ROMS NetCDF 2D fields.")
-
-    parser.add_argument("ncfile", help="Path to NetCDF grid file")
-
-    parser.add_argument("--var", default="mask_rho", help="2D variable name to display (default: mask_rho)")
-    parser.add_argument("--cmap", default="gray_r", help="Matplotlib colormap name (default: gray_r)")
-
-    parser.add_argument("--loglevel", default="INFO",
-                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-                        help="Logging level (default: INFO)")
-
-    parser.add_argument("--sources-geojson", default=None,
-                        help="Path to GeoJSON file with Lagrangian sources (lon/lat Points).")
-
-    parser.add_argument("--snap-sources-to-sea", action="store_true",
-                        help="Initial state: show sources snapped to nearest sea grid point.")
-
-    # NEW: rho-level sigma vector (comma-separated).
-    parser.add_argument(
-        "--s_rho",
-        type=str,
-        default=None,
-        help="Comma-separated ROMS s_rho values (rho levels), e.g. --s_rho -0.975,-0.925,...,-0.025"
-    )
-
-    # Export fallback if no dialog (or user cancels).
-    parser.add_argument(
-        "--default-output-json",
-        type=str,
-        default=None,
-        help="Default output JSON path used if no file is chosen in the dialog."
-    )
-
-    return parser.parse_args()
-
-
-# ---------------------------------------------------------------------
-# Main routine
-# ---------------------------------------------------------------------
-def main():
-    args = parse_args()  # Parse CLI.
-
-    logging.basicConfig(level=getattr(logging, args.loglevel),
-                        format="%(asctime)s [%(levelname)s] %(message)s")  # Setup logging.
-
-    logging.info(f"Matplotlib backend: {matplotlib.get_backend()}")  # Report backend.
-    logging.info(f"Matplotlib version: {matplotlib.__version__}")  # Report version.
-
-    # Parse s_rho (comma-separated floats).
-    s_rho_vals = None
-    if args.s_rho is not None:
-        try:
-            s_rho_vals = np.array([float(v.strip()) for v in args.s_rho.split(",") if v.strip() != ""], dtype=float)
-            if s_rho_vals.size == 0:
-                logging.warning("--s_rho provided but no valid numbers found.")
-                s_rho_vals = None
-            else:
-                logging.info(f"Parsed {s_rho_vals.size} rho-levels from --s_rho.")
-        except Exception as e:
-            logging.error(f"Error parsing --s_rho values: {e}")
-            sys.exit(1)
-
-    logging.info(f"Opening NetCDF file: {args.ncfile}")  # Log input.
-
-    # Open NetCDF.
+def load_geojson_sources(path):
+    """
+    Return (gj_obj, feature_indices) keeping geometry intact.
+    Points are in geometry.coordinates [lon,lat(,z)].
+    """
+    if not path:
+        return None, None
     try:
-        nc = Dataset(args.ncfile, "r")
+        with open(path, "r", encoding="utf-8") as f:
+            gj = json.load(f)
+
+        idxs = []
+        feats = gj.get("features", [])
+        for idx, feat in enumerate(feats):
+            geom = feat.get("geometry", {})
+            if geom.get("type") != "Point":
+                continue
+            coords = geom.get("coordinates", None)
+            if not coords or len(coords) < 2:
+                continue
+            idxs.append(idx)
+
+        if not idxs:
+            logging.warning("GeoJSON loaded but contains no valid Point features.")
+        return gj, idxs
     except Exception as e:
-        logging.error(f"Error opening NetCDF file: {e}")
-        sys.exit(1)
+        logging.error(f"Error reading GeoJSON '{path}': {e}")
+        return None, None
 
-    # Validate variable.
-    if args.var not in nc.variables:
-        logging.error(f"Variable '{args.var}' not found in file.")
-        logging.info("Available variables: " + ", ".join(nc.variables.keys()))
-        nc.close()
-        sys.exit(1)
 
-    # Read arrays.
-    var = nc.variables[args.var][:]
-    h = nc.variables["h"][:] if "h" in nc.variables else None
-    lon_rho = nc.variables["lon_rho"][:] if "lon_rho" in nc.variables else None
-    lat_rho = nc.variables["lat_rho"][:] if "lat_rho" in nc.variables else None
-    mask_rho = nc.variables["mask_rho"][:] if "mask_rho" in nc.variables else None
+# ============================================================
+# Source editor dialog
+# ============================================================
+class SourceEditorDialog(QtWidgets.QDialog):
+    """
+    Recomputes k whenever depth changes (if compute_k callback is provided).
+    Adds buttons near depth:
+      - Surface: depth=0
+      - Bottom: depth=h[j,i] if available
+    """
+    def __init__(self, parent, props: dict, compute_k_cb=None, compute_bottom_depth_cb=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit source")
+        self._result = None
 
-    nc.close()  # Close file.
+        self._compute_k_cb = compute_k_cb
+        self._compute_bottom_depth_cb = compute_bottom_depth_cb
 
-    data = np.array(var)  # Ensure ndarray.
-    if data.ndim != 2:
-        logging.error(f"Variable '{args.var}' is not 2D (ndim={data.ndim}).")
-        sys.exit(1)
+        self._working = json.loads(json.dumps(props if props is not None else {}))
 
-    ny, nx = data.shape
-    logging.info(f"{args.var} shape: (eta={ny}, xi={nx})")
+        layout = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+        layout.addLayout(form)
 
-    # Load GeoJSON sources (optional).
-    sources_lon = None
-    sources_lat = None
-    gj = None
-    feature_indices = None
+        self.ed_id = QtWidgets.QLineEdit(str(self._working.get("id", "")))
+        form.addRow("id", self.ed_id)
 
-    if args.sources_geojson is not None:
+        self.spn_i = QtWidgets.QSpinBox()
+        self.spn_i.setRange(-999999, 999999)
+        self.spn_i.setValue(int(self._working.get("i", 0)))
+        form.addRow("i (xi)", self.spn_i)
+
+        self.spn_j = QtWidgets.QSpinBox()
+        self.spn_j.setRange(-999999, 999999)
+        self.spn_j.setValue(int(self._working.get("j", 0)))
+        form.addRow("j (eta)", self.spn_j)
+
+        self.spn_k = QtWidgets.QSpinBox()
+        self.spn_k.setRange(-999999, 0)  # k is negative or 0
+        self.spn_k.setValue(int(self._working.get("k", 0)))
+        form.addRow("k", self.spn_k)
+
+        # Depth row with two buttons next to the depth field
+        depth_row = QtWidgets.QHBoxLayout()
+        self.dbl_depth = QtWidgets.QDoubleSpinBox()
+        self.dbl_depth.setDecimals(3)
+        self.dbl_depth.setRange(-1e9, 1e9)
+        self.dbl_depth.setSingleStep(0.5)
+        self.dbl_depth.setValue(float(self._working.get("depth", 0.0)))
+        depth_row.addWidget(self.dbl_depth, 1)
+
+        self.btn_surface = QtWidgets.QPushButton("Surface", self)
+        self.btn_surface.setToolTip("Set depth=0 (surface) and recompute k")
+        depth_row.addWidget(self.btn_surface)
+
+        self.btn_bottom = QtWidgets.QPushButton("Bottom", self)
+        self.btn_bottom.setToolTip("Set depth=h[j,i] (bottom) and recompute k")
+        depth_row.addWidget(self.btn_bottom)
+
+        depth_container = QtWidgets.QWidget(self)
+        depth_container.setLayout(depth_row)
+        form.addRow("depth (m, +down)", depth_container)
+
+        # Advanced JSON
+        layout.addWidget(QtWidgets.QLabel("Raw properties JSON (advanced):"))
+        self.json_text = QtWidgets.QPlainTextEdit(self)
+        self.json_text.setPlainText(json.dumps(self._working, indent=2, ensure_ascii=False))
+        self.json_text.setMinimumSize(700, 320)
+        layout.addWidget(self.json_text)
+
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            parent=self,
+        )
+        btns.accepted.connect(self._on_ok)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        # Wiring: depth changes -> recompute k
+        self.dbl_depth.valueChanged.connect(self._recompute_k_from_widgets)
+        self.spn_i.valueChanged.connect(self._recompute_k_from_widgets)
+        self.spn_j.valueChanged.connect(self._recompute_k_from_widgets)
+
+        self.btn_surface.clicked.connect(self._set_surface)
+        self.btn_bottom.clicked.connect(self._set_bottom)
+
+        self._recompute_k_from_widgets()
+
+    @property
+    def result(self):
+        return self._result
+
+    def _set_surface(self):
+        self.dbl_depth.blockSignals(True)
+        self.dbl_depth.setValue(0.0)
+        self.dbl_depth.blockSignals(False)
+        self._recompute_k_from_widgets()
+
+    def _set_bottom(self):
+        if self._compute_bottom_depth_cb is None:
+            return
+        i = int(self.spn_i.value())
+        j = int(self.spn_j.value())
+        bottom = self._compute_bottom_depth_cb(j, i)
+        if bottom is None:
+            QtWidgets.QMessageBox.warning(self, "Bottom depth", "Bathymetry 'h' not available or (j,i) out of bounds.")
+            return
+        self.dbl_depth.blockSignals(True)
+        self.dbl_depth.setValue(float(bottom))
+        self.dbl_depth.blockSignals(False)
+        self._recompute_k_from_widgets()
+
+    def _recompute_k_from_widgets(self):
+        if self._compute_k_cb is None:
+            return
+        i = int(self.spn_i.value())
+        j = int(self.spn_j.value())
+        depth = float(self.dbl_depth.value())
+        k = self._compute_k_cb(j, i, depth)
+        if k is None:
+            return
+        self.spn_k.blockSignals(True)
+        self.spn_k.setValue(int(k))
+        self.spn_k.blockSignals(False)
+
+    def _on_ok(self):
         try:
-            logging.info(f"Loading particle sources from GeoJSON: {args.sources_geojson}")
-            with open(args.sources_geojson, "r", encoding="utf-8") as f:
-                gj = json.load(f)
+            obj = json.loads(self.json_text.toPlainText() or "{}")
+            if not isinstance(obj, dict):
+                raise ValueError("JSON must be an object/dict.")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Invalid JSON", str(e))
+            return
 
-            feats = gj.get("features", [])
-            lons, lats, feature_indices = [], [], []
+        if self.ed_id.text().strip() != "":
+            obj["id"] = self.ed_id.text().strip()
 
-            for idx, feat in enumerate(feats):
-                geom = feat.get("geometry", {})
-                if geom.get("type") != "Point":
-                    continue
-                coords = geom.get("coordinates", None)
-                if not coords or len(coords) < 2:
-                    continue
-                lons.append(coords[0])
-                lats.append(coords[1])
-                feature_indices.append(idx)
+        obj["i"] = int(self.spn_i.value())
+        obj["j"] = int(self.spn_j.value())
+        obj["k"] = int(self.spn_k.value())
+        obj["depth"] = float(self.dbl_depth.value())
 
-            if lons:
-                sources_lon = np.array(lons, dtype=float)
-                sources_lat = np.array(lats, dtype=float)
-                logging.info(f"Loaded {len(sources_lon)} point sources from GeoJSON.")
-            else:
-                logging.warning("No valid Point geometries found in GeoJSON.")
+        self._result = obj
+        self.accept()
+
+
+# ============================================================
+# Viewer
+# ============================================================
+class Viewer(QtWidgets.QMainWindow):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+
+        # s_w vector drives k (negative index). Can be loaded via CLI or CSV menu.
+        self.s_w = parse_s_w(args.s_w) if getattr(args, "s_w", None) else None
+
+        self.setWindowTitle("ROMS NetCDF Viewer (Qt)")
+        self.resize(1400, 900)
+
+        # NetCDF state
+        self.nc_path = None
+        self.vars2d = []
+        self.current_var = None
+
+        self.data = None
+        self.lon_rho = None
+        self.lat_rho = None
+        self.mask_rho = None
+        self.h = None
+        self.full_extent = None
+
+        # Mapper caches
+        self._lon_sorted = None
+        self._xi_sorted = None
+        self._lat_sorted = None
+        self._eta_sorted = None
+
+        # GeoJSON state
+        self.gj = None
+        self.src_feat_indices = None
+
+        # Plot
+        self.fig, self.ax = plt.subplots()
+        self.canvas = FigureCanvas(self.fig)
+        self.toolbar = NavigationToolbar(self.canvas, self)
+
+        central = QtWidgets.QWidget(self)
+        v = QtWidgets.QVBoxLayout(central)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.addWidget(self.toolbar)
+        v.addWidget(self.canvas)
+        self.setCentralWidget(central)
+
+        self.status = self.statusBar()
+        self.status.showMessage("Ready")
+
+        self._build_menu()
+        self._build_dock()
+
+        # Rubber band zoom only with SHIFT + left-drag
+        self._rb = QtWidgets.QRubberBand(QtWidgets.QRubberBand.Rectangle, self.canvas)
+        self._rb_origin = None
+        self._rb_active = False
+
+        # Custom pan (left drag)
+        self._pan_active = False
+        self._pan_start_qp = None
+        self._pan_start_xlim = None
+        self._pan_start_ylim = None
+
+        self.canvas.installEventFilter(self)
+
+        # Single colorbar
+        self._im = None
+        self._cbar = None
+        self._ax_top = None
+        self._ax_right = None
+
+        # Sources overlay
+        self._scatter = None
+
+        # Matplotlib events
+        self.canvas.mpl_connect("scroll_event", self._on_scroll)
+        self.canvas.mpl_connect("motion_notify_event", self._on_motion)
+        self.canvas.mpl_connect("button_press_event", self._on_button_press_mpl)
+
+        # Clamp for toolbar actions too
+        self._clamp_busy = False
+        self.ax.callbacks.connect("xlim_changed", lambda _ax: self.clamp_view())
+        self.ax.callbacks.connect("ylim_changed", lambda _ax: self.clamp_view())
+
+        # Start disabled until NetCDF loaded
+        self._set_domain_loaded(False)
+
+        # Load GeoJSON if provided
+        if self.args.sources_geojson:
+            self.load_geojson(self.args.sources_geojson)
+
+        # Load NetCDF if provided; else force open
+        if getattr(self.args, "ncfile", None):
+            self.load_netcdf(self.args.ncfile)
+        else:
+            QtCore.QTimer.singleShot(0, self._force_open_netcdf)
+
+        # If s_w provided via CLI, show it
+        if self.s_w is not None:
+            self.status.showMessage(f"Loaded s_w from CLI (N={self.s_w.size})")
+
+    # ---------------- Domain state ----------------
+    def _set_domain_loaded(self, loaded: bool):
+        self.var_combo.setEnabled(loaded)
+        self.chk_snap.setEnabled(loaded)
+        self.btn_reset.setEnabled(loaded)
+        self.btn_export.setEnabled(bool(loaded and self.gj is not None and self.src_feat_indices is not None))
+
+    def _force_open_netcdf(self):
+        QtWidgets.QMessageBox.information(
+            self,
+            "Open NetCDF required",
+            "Please open a NetCDF file to define the domain.",
+        )
+        while self.nc_path is None:
+            self.open_netcdf()
+            if self.nc_path is None:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "NetCDF required",
+                    "A NetCDF file is required to proceed. Please select one.",
+                )
+
+    # ---------------- Menu/Dock ----------------
+    def _build_menu(self):
+        menubar = self.menuBar()
+
+        file_menu = menubar.addMenu("&File")
+
+        act_open_nc = QtGui.QAction("Open NetCDF…", self)
+        act_open_nc.setShortcut("Ctrl+O")
+        act_open_nc.triggered.connect(self.open_netcdf)
+        file_menu.addAction(act_open_nc)
+
+        act_open_gj = QtGui.QAction("Open GeoJSON…", self)
+        act_open_gj.setShortcut("Ctrl+G")
+        act_open_gj.triggered.connect(self.open_geojson)
+        file_menu.addAction(act_open_gj)
+
+        file_menu.addSeparator()
+
+        act_load_sw = QtGui.QAction("Load s_w CSV…", self)
+        act_load_sw.setShortcut("Ctrl+W")
+        act_load_sw.triggered.connect(self.load_s_w_csv)
+        file_menu.addAction(act_load_sw)
+
+        file_menu.addSeparator()
+
+        act_quit = QtGui.QAction("Quit", self)
+        act_quit.setShortcut("Ctrl+Q")
+        act_quit.triggered.connect(self.close)
+        file_menu.addAction(act_quit)
+
+        view_menu = menubar.addMenu("&View")
+        act_reset = QtGui.QAction("Reset view", self)
+        act_reset.setShortcut("Ctrl+R")
+        act_reset.triggered.connect(self.reset_view)
+        view_menu.addAction(act_reset)
+
+    def _build_dock(self):
+        dock = QtWidgets.QDockWidget("Controls", self)
+        dock.setAllowedAreas(QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea)
+
+        w = QtWidgets.QWidget(dock)
+        layout = QtWidgets.QVBoxLayout(w)
+
+        layout.addWidget(QtWidgets.QLabel("Variable (2D):", w))
+        self.var_combo = QtWidgets.QComboBox(w)
+        self.var_combo.currentTextChanged.connect(self.change_var)
+        layout.addWidget(self.var_combo)
+
+        self.chk_snap = QtWidgets.QCheckBox("Snap to sea", w)
+        self.chk_snap.setChecked(False)
+        self.chk_snap.stateChanged.connect(self._on_snap_toggle)
+        layout.addWidget(self.chk_snap)
+
+        self.btn_reset = QtWidgets.QPushButton("Reset view (full)", w)
+        self.btn_reset.clicked.connect(self.reset_view)
+        layout.addWidget(self.btn_reset)
+
+        self.btn_export = QtWidgets.QPushButton("Export GeoJSON", w)
+        self.btn_export.clicked.connect(self.export_geojson)
+        layout.addWidget(self.btn_export)
+
+        layout.addStretch(1)
+        dock.setWidget(w)
+        self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, dock)
+
+    def _on_snap_toggle(self):
+        if self.gj is not None and self.src_feat_indices is not None and self.nc_path is not None:
+            self.recompute_sources_ijk()
+        self.update_sources()
+
+    # ---------------- s_w CSV ----------------
+    def load_s_w_csv(self):
+        start = os.getcwd()
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load s_w from CSV", start, "CSV/TXT files (*.csv *.txt);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read()
+            sw = parse_s_w(text)
+            if sw is None or sw.size == 0:
+                raise ValueError("No valid float values found in the selected file.")
+            self.s_w = sw
+            logging.info(f"Loaded s_w from CSV '{path}' (N={self.s_w.size})")
+            self.status.showMessage(f"Loaded s_w from CSV (N={self.s_w.size}) -> recomputing k for sources")
+            # Recompute k for all sources immediately
+            if self.nc_path and self.gj is not None and self.src_feat_indices is not None:
+                self.recompute_sources_ijk()
+                self.update_sources()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Load s_w failed", str(e))
+            logging.error(f"Load s_w failed: {e}")
+
+    # ---------------- NetCDF / mapping ----------------
+    def open_netcdf(self):
+        start = os.path.dirname(self.nc_path) if self.nc_path else os.getcwd()
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open NetCDF", start, "NetCDF files (*.nc *.cdf *.netcdf);;All files (*)"
+        )
+        if path:
+            self.load_netcdf(path)
+
+    def _build_lonlat_mapper_cache(self):
+        self._lon_sorted = self._xi_sorted = self._lat_sorted = self._eta_sorted = None
+        if self.lon_rho is None or self.lat_rho is None:
+            return
+        ny, nx = self.lon_rho.shape
+        j_mid = ny // 2
+        i_mid = nx // 2
+
+        lon_mid = self.lon_rho[j_mid, :]
+        lat_mid = self.lat_rho[:, i_mid]
+
+        lon_sort = np.argsort(lon_mid)
+        lat_sort = np.argsort(lat_mid)
+
+        self._lon_sorted = lon_mid[lon_sort]
+        self._xi_sorted = np.arange(nx, dtype=float)[lon_sort]
+        self._lat_sorted = lat_mid[lat_sort]
+        self._eta_sorted = np.arange(ny, dtype=float)[lat_sort]
+
+    def lonlat_to_ij(self, lon, lat):
+        if self._lon_sorted is None or self._lat_sorted is None:
+            return None, None
+        xi = float(np.interp(lon, self._lon_sorted, self._xi_sorted, left=self._xi_sorted[0], right=self._xi_sorted[-1]))
+        eta = float(np.interp(lat, self._lat_sorted, self._eta_sorted, left=self._eta_sorted[0], right=self._eta_sorted[-1]))
+        return xi, eta
+
+    def compute_k(self, j, i, depth):
+        """
+        k is negative: 0 (surface) .. -(N-1) (bottom), where N=len(s_w).
+        If s_w is missing -> k=0.
+        We map depth (+down) to a sigma target s_target=-depth/H in [-1,0],
+        then choose the closest s_w level index idx and return k=-idx.
+        """
+        if self.s_w is None or self.h is None:
+            return 0
+        try:
+            ny, nx = self.h.shape
+            if not (0 <= j < ny and 0 <= i < nx):
+                return 0
+            H = float(self.h[j, i])
+            if not np.isfinite(H) or H <= 0.0:
+                return 0
+
+            depth_val = float(depth)
+            s_target = -depth_val / H
+            s_target = float(np.clip(s_target, -1.0, 0.0))
+
+            sw = np.asarray(self.s_w, dtype=float)
+            if sw.size == 0:
+                return 0
+
+            idx = int(np.argmin(np.abs(sw - s_target)))  # 0..N-1
+            return -idx  # negative index per request
+        except Exception:
+            return 0
+
+    def bottom_depth(self, j, i):
+        if self.h is None:
+            return None
+        ny, nx = self.h.shape
+        if not (0 <= j < ny and 0 <= i < nx):
+            return None
+        H = float(self.h[j, i])
+        if not np.isfinite(H) or H <= 0:
+            return None
+        return H
+
+    def load_netcdf(self, path):
+        self.nc_path = None
+        logging.info(f"Loading NetCDF: {path}")
+
+        try:
+            with Dataset(path, "r") as nc:
+                vars2d = []
+                for name, var in nc.variables.items():
+                    try:
+                        if var.ndim == 2:
+                            vars2d.append(name)
+                    except Exception:
+                        continue
+                if not vars2d:
+                    raise RuntimeError("No 2D variables found in this NetCDF.")
+
+                pref = []
+                for key in ("mask_rho", "h"):
+                    if key in vars2d:
+                        pref.append(key)
+                rest = sorted([v for v in vars2d if v not in pref])
+                self.vars2d = pref + rest
+
+                self.lon_rho = np.array(nc.variables["lon_rho"][:]) if "lon_rho" in nc.variables else None
+                self.lat_rho = np.array(nc.variables["lat_rho"][:]) if "lat_rho" in nc.variables else None
+                self.mask_rho = np.array(nc.variables["mask_rho"][:]) if "mask_rho" in nc.variables else None
+                self.h = np.array(nc.variables["h"][:]) if "h" in nc.variables else None
 
         except Exception as e:
-            logging.error(f"Error reading GeoJSON file: {e}")
+            QtWidgets.QMessageBox.critical(self, "Open NetCDF failed", str(e))
+            logging.error(f"Open NetCDF failed: {e}")
+            return
 
-    # Create figure.
-    fig, ax = plt.subplots(figsize=(12, 8))
+        self.nc_path = path
+        self._set_domain_loaded(True)
+        self._build_lonlat_mapper_cache()
 
-    # Display base field.
-    im = ax.imshow(data, origin="lower", cmap=args.cmap, interpolation="nearest")
-    plt.colorbar(im, ax=ax, label=f"{args.var}")
+        self.var_combo.blockSignals(True)
+        self.var_combo.clear()
+        self.var_combo.addItems(self.vars2d)
+        initial = self.args.var if self.args.var in self.vars2d else self.vars2d[0]
+        self.var_combo.setCurrentText(initial)
+        self.var_combo.blockSignals(False)
 
-    ax.set_title(f"{args.var} with bathymetry & sources (interactive)")
+        self.chk_snap.setChecked(bool(self.args.snap_sources_to_sea))
+        self.setWindowTitle(f"ROMS NetCDF Viewer (Qt) — {os.path.basename(path)}")
+        self.status.showMessage(f"Loaded NetCDF: {os.path.basename(path)}")
 
-    xmin_full, xmax_full = 0, nx - 1
-    ymin_full, ymax_full = 0, ny - 1
-    ax.set_xlim(xmin_full, xmax_full)
-    ax.set_ylim(ymin_full, ymax_full)
+        if self.gj is not None and self.src_feat_indices is not None:
+            self.recompute_sources_ijk()
 
-    # Bathymetry contours.
-    if h is not None:
-        logging.info("Adding bathymetry contours from 'h'")
-        h_data = np.array(h, dtype=float)
-        h_masked = np.ma.masked_where(mask_rho < 0.5, h_data) if mask_rho is not None else h_data
+        self.change_var(initial)
 
-        finite_vals = h_masked[np.isfinite(h_masked)]
-        if finite_vals.size > 0:
-            vmin = float(np.nanmin(finite_vals))
-            vmax = float(np.nanmax(finite_vals))
-            if vmax > vmin:
-                levels = np.linspace(vmin, vmax, 15)
-                cs = ax.contour(h_masked, levels=levels, colors="k", linewidths=0.3)
-                ax.clabel(cs, inline=True, fontsize=6, fmt="%.0f")
-        else:
-            logging.warning("No finite values in 'h' to contour.")
-    else:
-        logging.info("No 'h' variable found: skipping bathymetry contours.")
+    def change_var(self, name):
+        if not name or not self.nc_path:
+            return
+        self.current_var = name
+        try:
+            with Dataset(self.nc_path, "r") as nc:
+                self.data = np.array(nc.variables[name][:])
+            if self.data.ndim != 2:
+                raise RuntimeError(f"Variable '{name}' is not 2D.")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Read variable failed", str(e))
+            logging.error(f"Read variable failed: {e}")
+            return
 
-    # Status bar.
-    ax.format_coord = make_format_coord(data, lon_rho=lon_rho, lat_rho=lat_rho)
+        self.args.var = name
+        self.redraw()
 
-    # Axes: lon/lat + xi/eta if available.
-    if lon_rho is not None and lat_rho is not None:
-        logging.info("Configuring axes: bottom=lon, top=xi, left=lat, right=eta.")
-        mid_j = ny // 2
-        mid_i = nx // 2
+    # ---------------- GeoJSON ----------------
+    def open_geojson(self):
+        start = os.path.dirname(self.args.sources_geojson) if self.args.sources_geojson else os.getcwd()
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open GeoJSON", start, "GeoJSON/JSON files (*.geojson *.json);;All files (*)"
+        )
+        if not path:
+            return
+        self.args.sources_geojson = path
+        self.load_geojson(path)
+        if self.nc_path:
+            self.recompute_sources_ijk()
+            self.update_sources()
+        self.status.showMessage(f"Loaded GeoJSON: {os.path.basename(path)}")
 
+    def load_geojson(self, path):
+        self.gj, self.src_feat_indices = load_geojson_sources(path)
+        self.btn_export.setEnabled(bool(self.nc_path and self.gj is not None and self.src_feat_indices is not None))
+        if self.nc_path and self.gj is not None and self.src_feat_indices is not None:
+            self.recompute_sources_ijk()
+
+    def recompute_sources_ijk(self):
+        """
+        For each Point feature:
+        - lon/lat from geometry.coordinates
+        - depth from properties (default 0)
+        - (xi,eta) from lon/lat
+        - if snap enabled: snap (xi,eta)
+        - properties i/j from rounded indices
+        - properties k from depth using s_w (negative indexing)
+        """
+        if self.gj is None or self.src_feat_indices is None:
+            return
+        if self.nc_path is None:
+            return
+
+        use_snap = bool(self.chk_snap.isChecked() and self.mask_rho is not None)
+        feats = self.gj.get("features", [])
+
+        for idx in self.src_feat_indices:
+            feat = feats[idx]
+            geom = feat.get("geometry", {})
+            coords = geom.get("coordinates", None)
+            if not coords or len(coords) < 2:
+                continue
+            lon = float(coords[0])
+            lat = float(coords[1])
+
+            props = feat.setdefault("properties", {})
+            depth = float(props.get("depth", 0.0))
+
+            xi, eta = self.lonlat_to_ij(lon, lat)
+            if xi is None:
+                continue
+
+            if use_snap:
+                xi, eta = snap_to_nearest_sea(xi, eta, self.mask_rho)
+
+            i_idx = int(round(xi))
+            j_idx = int(round(eta))
+
+            props["i"] = i_idx
+            props["j"] = j_idx
+            props["k"] = self.compute_k(j_idx, i_idx, depth)
+
+    # ---------------- Plot / sources overlay ----------------
+    def _ensure_secondary_axes(self):
+        self._ax_top = self.ax.secondary_xaxis("top", functions=(lambda x: x, lambda x: x))
+        self._ax_right = self.ax.secondary_yaxis("right", functions=(lambda y: y, lambda y: y))
+        self._ax_top.set_xlabel("i (xi)")
+        self._ax_right.set_ylabel("j (eta)")
+
+    def _set_lonlat_ticks(self):
+        ny, nx = self.data.shape
         xticks = np.linspace(0, nx - 1, 6, dtype=int)
         yticks = np.linspace(0, ny - 1, 6, dtype=int)
 
-        ax.set_xticks(xticks)
-        ax.set_xticklabels([f"{lon_rho[mid_j, i]:.3f}" for i in xticks])
-        ax.set_xlabel("longitude (°E)")
+        self._ax_top.set_xticks(xticks)
+        self._ax_top.set_xticklabels([str(int(i)) for i in xticks])
+        self._ax_right.set_yticks(yticks)
+        self._ax_right.set_yticklabels([str(int(j)) for j in yticks])
 
-        ax_top = ax.secondary_xaxis("top", functions=(lambda x: x, lambda x: x))
-        ax_top.set_xticks(xticks)
-        ax_top.set_xticklabels([str(i) for i in xticks])
-        ax_top.set_xlabel("xi index")
-
-        ax.set_yticks(yticks)
-        ax.set_yticklabels([f"{lat_rho[j, mid_i]:.3f}" for j in yticks])
-        ax.set_ylabel("latitude (°N)")
-
-        ax_right = ax.secondary_yaxis("right", functions=(lambda y: y, lambda y: y))
-        ax_right.set_yticks(yticks)
-        ax_right.set_yticklabels([str(j) for j in yticks])
-        ax_right.set_ylabel("eta index")
-    else:
-        logging.info("lon_rho/lat_rho not found: using indices on both axes as fallback.")
-        ax.set_xlabel("xi index")
-        ax.set_ylabel("eta index")
-
-    # Info overlay.
-    info_text = ax.text(
-        0.01, 0.01, "",
-        transform=ax.transAxes,
-        fontsize=8,
-        va="bottom",
-        ha="left",
-        bbox=dict(facecolor="white", alpha=0.7, edgecolor="black"),
-        zorder=10,
-        visible=False,
-    )
-
-    # Get Tk parent window from Matplotlib (TkAgg).
-    tk_parent = None
-    if TK_AVAILABLE and "TkAgg" in matplotlib.get_backend():
-        try:
-            tk_parent = fig.canvas.manager.window  # Tk window hosting the figure.
-        except Exception:
-            tk_parent = None
-
-    # Shared state.
-    state = {
-        "scatter": None,
-        "use_snapped": False,
-        "xi_raw": None,
-        "eta_raw": None,
-        "xi_snapped": None,
-        "eta_snapped": None,
-        "gj": gj,
-        "feature_indices": feature_indices,
-        "sources_path": args.sources_geojson,
-        "info_text": info_text,
-        "lon_rho": lon_rho,
-        "lat_rho": lat_rho,
-        "s_rho": s_rho_vals,
-        "h": h,
-        "default_output_json": args.default_output_json,
-        "tk_parent": tk_parent,
-    }
-
-    # Overlay sources.
-    if sources_lon is not None and sources_lat is not None:
-        if lon_rho is None or lat_rho is None:
-            logging.warning("Sources loaded but lon_rho/lat_rho missing: cannot map to grid.")
+        if self.lon_rho is not None and self.lat_rho is not None:
+            mid_j = ny // 2
+            mid_i = nx // 2
+            self.ax.set_xticks(xticks)
+            self.ax.set_xticklabels([f"{self.lon_rho[mid_j, i]:.4f}" for i in xticks])
+            self.ax.set_xlabel("longitude (°E)")
+            self.ax.set_yticks(yticks)
+            self.ax.set_yticklabels([f"{self.lat_rho[j, mid_i]:.4f}" for j in yticks])
+            self.ax.set_ylabel("latitude (°N)")
         else:
-            logging.info("Mapping sources (lon/lat) to grid indices.")
-            lonlat_to_ij = build_lonlat_index_mappers(lon_rho, lat_rho)
+            self.ax.set_xticks(xticks)
+            self.ax.set_xticklabels([str(int(i)) for i in xticks])
+            self.ax.set_xlabel("i (xi)")
+            self.ax.set_yticks(yticks)
+            self.ax.set_yticklabels([str(int(j)) for j in yticks])
+            self.ax.set_ylabel("j (eta)")
 
-            xi_raw = []
-            eta_raw = []
-            for lon, lat in zip(sources_lon, sources_lat):
-                xi, eta = lonlat_to_ij(lon, lat)
-                xi_raw.append(xi)
-                eta_raw.append(eta)
+    def redraw(self):
+        self.ax.clear()
+        self._ensure_secondary_axes()
 
-            xi_raw = np.array(xi_raw, dtype=float)
-            eta_raw = np.array(eta_raw, dtype=float)
+        self._im = self.ax.imshow(self.data, origin="lower", interpolation="nearest")
 
-            xi_snapped = None
-            eta_snapped = None
-            if mask_rho is not None:
-                logging.info("Precomputing snapped positions to nearest sea grid point.")
-                snapped_x = []
-                snapped_y = []
-                for x, y in zip(xi_raw, eta_raw):
-                    sx, sy = snap_to_nearest_sea(x, y, mask_rho)
-                    snapped_x.append(sx)
-                    snapped_y.append(sy)
-                xi_snapped = np.array(snapped_x, dtype=float)
-                eta_snapped = np.array(snapped_y, dtype=float)
+        if self._cbar is not None:
+            try:
+                self._cbar.remove()
+            except Exception:
+                pass
+            self._cbar = None
+        self._cbar = self.fig.colorbar(self._im, ax=self.ax)
+        self._cbar.set_label(self.current_var or "")
 
-            use_snapped = bool(args.snap_sources_to_sea and xi_snapped is not None)
-            xi_plot = xi_snapped if use_snapped and xi_snapped is not None else xi_raw
-            eta_plot = eta_snapped if use_snapped and eta_snapped is not None else eta_raw
+        ny, nx = self.data.shape
+        self.full_extent = (0, nx - 1, 0, ny - 1)
+        self.ax.set_xlim(0, nx - 1)
+        self.ax.set_ylim(0, ny - 1)
 
-            scatter = ax.scatter(
-                xi_plot, eta_plot,
+        self.ax.set_title(self.current_var or "")
+        self._set_lonlat_ticks()
+
+        if self.h is not None:
+            try:
+                h_plot = np.array(self.h, dtype=float)
+                if self.mask_rho is not None:
+                    h_plot = np.ma.masked_where(self.mask_rho < 0.5, h_plot)
+                finite = h_plot[np.isfinite(h_plot)]
+                if finite.size > 0:
+                    vmin = float(np.nanmin(finite))
+                    vmax = float(np.nanmax(finite))
+                    if vmax > vmin:
+                        levels = np.linspace(vmin, vmax, 15)
+                        cs = self.ax.contour(h_plot, levels=levels, colors="k", linewidths=0.3)
+                        self.ax.clabel(cs, inline=True, fontsize=6, fmt="%.0f")
+            except Exception as e:
+                logging.warning(f"Contour 'h' failed: {e}")
+
+        self.update_sources()
+        self.fig.tight_layout()
+        self.canvas.draw_idle()
+
+    def update_sources(self):
+        if self._scatter is not None:
+            try:
+                self._scatter.remove()
+            except Exception:
+                pass
+            self._scatter = None
+
+        if self.gj is None or self.src_feat_indices is None or self.nc_path is None:
+            self.canvas.draw_idle()
+            return
+
+        self.recompute_sources_ijk()
+
+        feats = self.gj.get("features", [])
+        xs, ys = [], []
+        for idx in self.src_feat_indices:
+            props = feats[idx].get("properties", {})
+            if "i" in props and "j" in props:
+                xs.append(float(props["i"]))
+                ys.append(float(props["j"]))
+
+        if xs:
+            self._scatter = self.ax.scatter(
+                xs, ys,
                 facecolors="none",
-                edgecolors="red",
+                edgecolors="r",
                 s=40,
                 linewidths=1.0,
-                label="Lagrangian sources",
+                picker=True,
                 zorder=5
             )
-            scatter.set_picker(True)
-            ax.legend(loc="upper right", fontsize=8)
+        self.canvas.draw_idle()
 
-            state["scatter"] = scatter
-            state["use_snapped"] = use_snapped
-            state["xi_raw"] = xi_raw
-            state["eta_raw"] = eta_raw
-            state["xi_snapped"] = xi_snapped
-            state["eta_snapped"] = eta_snapped
+    # ---------------- Reset / clamp ----------------
+    def reset_view(self):
+        if self.full_extent is None:
+            return
+        xmin, xmax, ymin, ymax = self.full_extent
+        self.ax.set_xlim(xmin, xmax)
+        self.ax.set_ylim(ymin, ymax)
+        self.canvas.draw_idle()
+        self.status.showMessage("View reset (full extent)")
 
-            # Snap-to-sea checkbox.
-            if xi_snapped is not None:
-                ax_check = plt.axes([0.02, 0.80, 0.16, 0.10])
-                check = CheckButtons(ax_check, labels=["Snap to sea"], actives=[state["use_snapped"]])
+    def clamp_view(self):
+        if self.full_extent is None or self._clamp_busy:
+            return
+        self._clamp_busy = True
+        try:
+            xmin_f, xmax_f, ymin_f, ymax_f = self.full_extent
+            xmin, xmax = self.ax.get_xlim()
+            ymin, ymax = self.ax.get_ylim()
 
-                def on_check(_label):
-                    state["use_snapped"] = not state["use_snapped"]
-                    use = state["use_snapped"]
+            if xmax < xmin:
+                xmin, xmax = xmax, xmin
+            if ymax < ymin:
+                ymin, ymax = ymax, ymin
 
-                    if use and state["xi_snapped"] is None:
-                        logging.warning("Snap requested but snapped positions not available.")
-                        state["use_snapped"] = False
-                        return
+            if (xmax - xmin) >= (xmax_f - xmin_f):
+                xmin, xmax = xmin_f, xmax_f
+            if (ymax - ymin) >= (ymax_f - ymin_f):
+                ymin, ymax = ymin_f, ymax_f
 
-                    if use and state["xi_snapped"] is not None:
-                        xs, ys = state["xi_snapped"], state["eta_snapped"]
-                    else:
-                        xs, ys = state["xi_raw"], state["eta_raw"]
+            if xmin < xmin_f:
+                xmax += (xmin_f - xmin)
+                xmin = xmin_f
+            if xmax > xmax_f:
+                xmin -= (xmax - xmax_f)
+                xmax = xmax_f
 
-                    state["scatter"].set_offsets(np.column_stack([xs, ys]))
-                    ax.figure.canvas.draw_idle()
+            if ymin < ymin_f:
+                ymax += (ymin_f - ymin)
+                ymin = ymin_f
+            if ymax > ymax_f:
+                ymin -= (ymax - ymax_f)
+                ymax = ymax_f
 
-                check.on_clicked(on_check)
+            xmin = max(xmin_f, xmin)
+            xmax = min(xmax_f, xmax)
+            ymin = max(ymin_f, ymin)
+            ymax = min(ymax_f, ymax)
 
-            # Export button.
-            if state["gj"] is not None and state["feature_indices"] is not None:
-                ax_button = plt.axes([0.02, 0.70, 0.16, 0.06])
-                btn = Button(ax_button, "Export JSON")
+            self.ax.set_xlim(xmin, xmax)
+            self.ax.set_ylim(ymin, ymax)
+        finally:
+            self._clamp_busy = False
 
-                def on_export(_event):
-                    gj_src = state["gj"]
-                    feat_idx = state["feature_indices"]
-                    default_output = state.get("default_output_json")
-                    parent = state.get("tk_parent")
+    # ---------------- Source editor on dblclick ----------------
+    def _open_source_editor_by_scatter_index(self, scatter_idx: int):
+        if self.gj is None or self.src_feat_indices is None:
+            return
+        if scatter_idx < 0 or scatter_idx >= len(self.src_feat_indices):
+            return
+        feat = self.gj["features"][self.src_feat_indices[scatter_idx]]
+        props = feat.setdefault("properties", {})
 
-                    if gj_src is None or feat_idx is None:
-                        logging.error("No GeoJSON state available; cannot export.")
-                        return
-
-                    # Deep copy so repeated exports don’t keep mutating in-memory object.
-                    gj_obj = json.loads(json.dumps(gj_src))
-
-                    use = state["use_snapped"]
-                    if use and state["xi_snapped"] is not None:
-                        xs, ys = state["xi_snapped"], state["eta_snapped"]
-                    else:
-                        xs, ys = state["xi_raw"], state["eta_raw"]
-
-                    s_rho = state.get("s_rho", None)
-                    h_arr = state.get("h", None)
-
-                    # Update features.
-                    for idx, x, y in zip(feat_idx, xs, ys):
-                        feat = gj_obj["features"][idx]
-                        props = feat.setdefault("properties", {})
-
-                        i_idx = int(round(float(x)))
-                        j_idx = int(round(float(y)))
-                        props["i"] = i_idx
-                        props["j"] = j_idx
-
-                        props["start"] = -1.0
-                        props["end"] = -1.0
-                        props["mode"] = 1
-                        props["particlesPerHour"] = 100
-                        props["depth"] = 0.0
-
-                        # depth -> k using s_rho (rho-level).
-                        if s_rho is not None and h_arr is not None and "depth" in props:
-                            try:
-                                depth_val = float(props.get("depth"))  # meters, positive down
-                                ny_h, nx_h = h_arr.shape
-                                if not (0 <= j_idx < ny_h and 0 <= i_idx < nx_h):
-                                    logging.warning(f"(j,i)=({j_idx},{i_idx}) out of h bounds; cannot compute k.")
-                                    continue
-
-                                H = float(h_arr[j_idx, i_idx])
-                                if not np.isfinite(H) or H <= 0.0:
-                                    logging.warning(f"h({j_idx},{i_idx}) invalid (H={H}); cannot compute k.")
-                                    continue
-
-                                s_target = -depth_val / H
-                                s_target = float(np.clip(s_target, -1.0, 0.0))
-
-                                s_rho_arr = np.asarray(s_rho, dtype=float)
-                                k = int(np.argmin(np.abs(s_rho_arr - s_target)))
-                                props["k"] = k
-
-                                source_id = props.get("id", f"feature_{idx}")
-                                logging.debug(
-                                    f"Source {source_id}: depth={depth_val}, H={H}, "
-                                    f"s_target={s_target:.4f}, k={k}, s_rho[k]={s_rho_arr[k]:.4f}"
-                                )
-
-                            except Exception as e:
-                                logging.warning(f"Could not convert depth to k for feature {idx}: {e}")
-                        else:
-                            props["k"] = 0
-
-                    # Default output name for dialog.
-                    base_out = "sources_with_indices"
-                    if state["sources_path"] is not None:
-                        in_path = state["sources_path"]
-                        base_out = os.path.splitext(os.path.basename(in_path))[0]
-                    suffix = "_snapped" if use else "_indices"
-                    default_name = f"{base_out}{suffix}.json"
-                    initial_dir = os.path.dirname(state["sources_path"]) if state["sources_path"] else "."
-
-                    file_path = None
-
-                    # File dialog if possible (TkAgg).
-                    if TK_AVAILABLE and parent is not None:
-                        try:
-                            file_path = filedialog.asksaveasfilename(
-                                parent=parent,
-                                defaultextension=".json",
-                                initialfile=default_name,
-                                initialdir=initial_dir,
-                                filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
-                            )
-                        except Exception as e:
-                            logging.error(f"Error opening file dialog: {e}")
-                            file_path = None
-
-                    # Fallback output.
-                    if not file_path:
-                        if default_output is not None:
-                            file_path = default_output
-                            logging.info(f"Using --default-output-json for export: {file_path}")
-                        else:
-                            logging.error("No file chosen and no --default-output-json provided; export aborted.")
-                            return
-
-                    if not file_path.lower().endswith(".json"):
-                        file_path += ".json"
-
-                    # Write JSON.
-                    try:
-                        with open(file_path, "w", encoding="utf-8") as f_out:
-                            json.dump(gj_obj, f_out, indent=2, ensure_ascii=False)
-                        logging.info(
-                            f"Exported modified JSON with i/j"
-                            f"{' and k' if s_rho is not None else ''} to: {file_path}"
-                        )
-                    except Exception as e:
-                        logging.error(f"Error writing JSON file: {e}")
-
-                btn.on_clicked(on_export)
-
-            # Pick handler.
-            def on_pick(event):
-                if event.artist is not state["scatter"]:
-                    return
-
-                ind = event.ind
-                if ind is None or len(ind) == 0:
-                    return
-
-                src_idx = int(ind[0])
-                gj_obj = state["gj"]
-                feat_idx = state["feature_indices"]
-                if gj_obj is None or feat_idx is None or src_idx >= len(feat_idx):
-                    return
-
-                use = state["use_snapped"]
-                if use and state["xi_snapped"] is not None:
-                    x = state["xi_snapped"][src_idx]
-                    y = state["eta_snapped"][src_idx]
-                else:
-                    x = state["xi_raw"][src_idx]
-                    y = state["eta_raw"][src_idx]
-
-                ix = int(round(x))
-                iy = int(round(y))
-
-                lon = lat = None
-                if state["lon_rho"] is not None and state["lat_rho"] is not None:
-                    ny_loc, nx_loc = state["lon_rho"].shape
-                    if 0 <= iy < ny_loc and 0 <= ix < nx_loc:
-                        lon = float(state["lon_rho"][iy, ix])
-                        lat = float(state["lat_rho"][iy, ix])
-
-                feat = gj_obj["features"][feat_idx[src_idx]]
-                props = feat.setdefault("properties", {})
-
-                lines = [f"Source #{src_idx}", f"i (xi) = {ix}, j (eta) = {iy}"]
-                if lon is not None and lat is not None:
-                    lines.append(f"lon = {lon:.5f}, lat = {lat:.5f}")
-                if props:
-                    lines.append("properties:")
-                    for k, v in list(props.items())[:6]:
-                        lines.append(f"  {k} = {v}")
-                    if len(props) > 6:
-                        lines.append("  ...")
-
-                state["info_text"].set_text("\n".join(lines))
-                state["info_text"].set_visible(True)
-                ax.figure.canvas.draw_idle()
-
-                # Open editor dialog if possible.
-                parent = state.get("tk_parent")
-                if TK_AVAILABLE and parent is not None:
-                    logging.info(f"Editing properties for source #{src_idx}")
-                    new_props = edit_properties_dialog(parent, props)
-                    if new_props is not None:
-                        feat["properties"] = new_props
-                        logging.info(f"Updated properties for source #{src_idx}")
-                else:
-                    logging.warning("No Tk parent window available: skipping edit dialog.")
-
-            fig.canvas.mpl_connect("pick_event", on_pick)
-
-    # Scroll zoom.
-    fig.canvas.mpl_connect("scroll_event", lambda event: scroll_zoom(event, ax))
-
-    # Rectangle zoom.
-    if use_new_rectangle_selector_api():
-        RectangleSelector(
-            ax,
-            lambda eclick, erelease: zoom_rect(eclick, erelease, ax),
-            useblit=False,
-            props=dict(facecolor="none", edgecolor="red", linewidth=1),
+        dlg = SourceEditorDialog(
+            self,
+            props,
+            compute_k_cb=lambda j, i, depth: self.compute_k(j, i, depth),
+            compute_bottom_depth_cb=lambda j, i: self.bottom_depth(j, i),
         )
-    else:
-        RectangleSelector(
-            ax,
-            lambda eclick, erelease: zoom_rect(eclick, erelease, ax),
-            drawtype="box",
-            useblit=True,
-            button=[1],
-            minspanx=5,
-            minspany=5,
-            spancoords="pixels",
-            interactive=True
+        if dlg.exec() == QtWidgets.QDialog.Accepted and dlg.result is not None:
+            feat["properties"] = dlg.result
+            try:
+                j = int(feat["properties"].get("j", 0))
+                i = int(feat["properties"].get("i", 0))
+                depth = float(feat["properties"].get("depth", 0.0))
+                feat["properties"]["k"] = self.compute_k(j, i, depth)
+            except Exception:
+                pass
+            self.update_sources()
+
+    def _on_button_press_mpl(self, ev):
+        if not getattr(ev, "dblclick", False):
+            return
+        if self._scatter is None or ev.inaxes != self.ax:
+            return
+        try:
+            contains, info = self._scatter.contains(ev)
+        except Exception:
+            return
+        if not contains:
+            return
+        inds = info.get("ind", [])
+        if inds is None or len(inds) == 0:
+            return
+        self._open_source_editor_by_scatter_index(int(inds[0]))
+
+    # ---------------- Export ----------------
+    def export_geojson(self):
+        if self.gj is None or self.src_feat_indices is None:
+            return
+        if self.nc_path is not None:
+            self.recompute_sources_ijk()
+
+        start_dir = os.path.dirname(self.args.sources_geojson) if self.args.sources_geojson else os.getcwd()
+        base = os.path.splitext(os.path.basename(self.args.sources_geojson or "sources"))[0]
+        suffix = "_snapped" if bool(self.chk_snap.isChecked() and self.mask_rho is not None) else "_indices"
+        default_name = f"{base}{suffix}.json"
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export GeoJSON", os.path.join(start_dir, default_name),
+            "JSON files (*.json);;All files (*)"
         )
+        if not path:
+            if self.args.default_output_json:
+                path = self.args.default_output_json
+            else:
+                return
+        if not path.lower().endswith(".json"):
+            path += ".json"
 
-    # Keyboard shortcuts.
-    key_handler = make_key_handler(ax, full_extent=(xmin_full, xmax_full, ymin_full, ymax_full))
-    fig.canvas.mpl_connect("key_press_event", key_handler)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.gj, f, indent=2, ensure_ascii=False)
+            self.status.showMessage(f"Exported: {path}")
+            logging.info(f"Exported GeoJSON: {path}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Export failed", str(e))
+            logging.error(f"Export failed: {e}")
 
-    plt.tight_layout()
-    plt.show()
+    # ---------------- Matplotlib events ----------------
+    def _on_scroll(self, ev):
+        if ev.inaxes != self.ax or ev.xdata is None or ev.ydata is None:
+            return
+        scale = 0.8 if ev.button == "up" else 1.25
+        xmin, xmax = self.ax.get_xlim()
+        ymin, ymax = self.ax.get_ylim()
+
+        w = (xmax - xmin) * scale
+        h = (ymax - ymin) * scale
+        self.ax.set_xlim(ev.xdata - w / 2, ev.xdata + w / 2)
+        self.ax.set_ylim(ev.ydata - h / 2, ev.ydata + h / 2)
+
+        self.clamp_view()
+        self.canvas.draw_idle()
+
+    def _on_motion(self, ev):
+        if ev.inaxes != self.ax or ev.xdata is None or ev.ydata is None or self.data is None:
+            return
+        i = int(round(ev.xdata))
+        j = int(round(ev.ydata))
+        ny, nx = self.data.shape
+        if 0 <= i < nx and 0 <= j < ny:
+            val = self.data[j, i]
+            if self.lon_rho is not None and self.lat_rho is not None:
+                lon = float(self.lon_rho[j, i])
+                lat = float(self.lat_rho[j, i])
+                self.status.showMessage(f"i={i}, j={j}, lon={lon:.5f}, lat={lat:.5f}, value={val:.3f}")
+            else:
+                self.status.showMessage(f"i={i}, j={j}, value={val:.3f}")
+
+    # ---------------- Qt6-safe mouse position + pan/zoom ----------------
+    def _event_pos_qpoint(self, event):
+        if hasattr(event, "position"):
+            return event.position().toPoint()
+        return event.pos()
+
+    def _toolbar_active(self):
+        try:
+            return bool(getattr(self.toolbar, "mode", ""))
+        except Exception:
+            return False
+
+    def _pixel_to_data(self, qpoint: QtCore.QPoint):
+        w, h = self.canvas.get_width_height()
+        xpix = int(qpoint.x())
+        ypix = int(qpoint.y())
+        disp = (int(xpix), int(h - ypix))
+        inv = self.ax.transData.inverted()
+        xdata, ydata = inv.transform(disp)
+        return float(xdata), float(ydata)
+
+    def eventFilter(self, obj, event):
+        if obj is self.canvas:
+            if self._toolbar_active():
+                return False
+
+            et = event.type()
+
+            if et == QtCore.QEvent.MouseButtonPress:
+                if event.button() == QtCore.Qt.LeftButton:
+                    mods = event.modifiers()
+                    pos = self._event_pos_qpoint(event)
+
+                    if mods & QtCore.Qt.ShiftModifier:
+                        self._rb_active = True
+                        self._rb_origin = pos
+                        self._rb.setGeometry(QtCore.QRect(self._rb_origin, QtCore.QSize()))
+                        self._rb.show()
+                        return True
+
+                    self._pan_active = True
+                    self._pan_start_qp = pos
+                    self._pan_start_xlim = self.ax.get_xlim()
+                    self._pan_start_ylim = self.ax.get_ylim()
+                    return True
+
+                if event.button() == QtCore.Qt.RightButton:
+                    self.reset_view()
+                    return True
+
+            elif et == QtCore.QEvent.MouseMove:
+                pos = self._event_pos_qpoint(event)
+
+                if self._rb_active and self._rb_origin is not None:
+                    rect = QtCore.QRect(self._rb_origin, pos).normalized()
+                    self._rb.setGeometry(rect)
+                    return True
+
+                if self._pan_active and self._pan_start_qp is not None:
+                    x0, y0 = self._pixel_to_data(self._pan_start_qp)
+                    x1, y1 = self._pixel_to_data(pos)
+                    dx = x1 - x0
+                    dy = y1 - y0
+
+                    xmin0, xmax0 = self._pan_start_xlim
+                    ymin0, ymax0 = self._pan_start_ylim
+
+                    self.ax.set_xlim(xmin0 - dx, xmax0 - dx)
+                    self.ax.set_ylim(ymin0 - dy, ymax0 - dy)
+
+                    self.clamp_view()
+                    self.canvas.draw_idle()
+                    return True
+
+            elif et == QtCore.QEvent.MouseButtonRelease:
+                pos = self._event_pos_qpoint(event)
+
+                if event.button() == QtCore.Qt.LeftButton:
+                    if self._rb_active:
+                        self._rb.hide()
+                        self._rb_active = False
+                        rect = QtCore.QRect(self._rb_origin, pos).normalized()
+                        self._rb_origin = None
+
+                        if rect.width() >= 5 and rect.height() >= 5:
+                            w, h = self.canvas.get_width_height()
+                            x0, x1 = int(rect.left()), int(rect.right())
+                            y0, y1 = int(rect.top()), int(rect.bottom())
+
+                            p0_disp = (int(x0), int(h - y1))
+                            p1_disp = (int(x1), int(h - y0))
+
+                            inv = self.ax.transData.inverted()
+                            (xdata0, ydata0) = inv.transform(p0_disp)
+                            (xdata1, ydata1) = inv.transform(p1_disp)
+
+                            xmin, xmax = sorted([xdata0, xdata1])
+                            ymin, ymax = sorted([ydata0, ydata1])
+
+                            self.ax.set_xlim(xmin, xmax)
+                            self.ax.set_ylim(ymin, ymax)
+                            self.clamp_view()
+                            self.canvas.draw_idle()
+
+                        return True
+
+                    if self._pan_active:
+                        self._pan_active = False
+                        self._pan_start_qp = None
+                        self._pan_start_xlim = None
+                        self._pan_start_ylim = None
+                        return True
+
+        return super().eventFilter(obj, event)
+
+
+# ============================================================
+# CLI
+# ============================================================
+def parse_args():
+    p = argparse.ArgumentParser(add_help=True)
+    p.add_argument("ncfile", nargs="?", default=None, help="Path to NetCDF file")
+    p.add_argument("--var", default="mask_rho", help="Default 2D variable to show")
+    p.add_argument("--sources-geojson", default=None, help="GeoJSON with Point sources (lon/lat)")
+    p.add_argument("--snap-sources-to-sea", action="store_true", help="Initial snap-to-sea state")
+    p.add_argument("--default-output-json", default=None, help="Fallback export path")
+    # NEW: s_w (w-levels) drives negative k
+    p.add_argument("--s_w", default=None, help="Comma-separated ROMS s_w values (w-levels), e.g. -1.0,-0.9,...,0.0")
+    p.add_argument("--loglevel", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.loglevel),
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    logging.info(f"Qt binding: {QT_LIB}")
+    logging.info(f"Matplotlib backend: {matplotlib.get_backend()} ({matplotlib.__version__})")
+
+    app = QtWidgets.QApplication(sys.argv)
+    w = Viewer(args)
+    w.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
     main()
-
-

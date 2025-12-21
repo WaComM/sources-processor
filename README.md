@@ -1,6 +1,6 @@
 # main.py — ROMS Grid Viewer & GeoJSON Source Processor
 
-An interactive Matplotlib viewer for **2D fields** in a **ROMS-style NetCDF grid**, with optional overlay of **Lagrangian particle sources** from GeoJSON and export of updated source indices (and optional vertical index `k` computed from depth using `s_rho`).
+An interactive Matplotlib viewer for **2D fields** in a **ROMS-style NetCDF grid**, with optional overlay of **Lagrangian particle sources** from GeoJSON and export of updated source indices (and optional vertical index `k` computed from depth using `s_w`).
 
 This tool is designed for interactive exploration:
 - visualize a 2D grid variable (default: `mask_rho`)
@@ -18,12 +18,11 @@ This tool is designed for interactive exploration:
 - **Snap-to-sea**: move each source to nearest sea point using `mask_rho`.
 - **Export**:
   - adds `i` (xi) and `j` (eta) indices to each source feature properties
-  - optionally adds `k` (vertical index) derived from a `depth` property using `--s_rho`
-  - export uses a **deep copy** of the GeoJSON so repeated exports don’t accumulate mutations
+  - optionally adds `k` (vertical index) derived from a `depth` property using `--s_w`
 - **Interactive controls**:
   - mouse wheel zoom
-  - rectangle zoom (drag)
-  - keys: `r` reset, `+` zoom in, `-` zoom out
+  - rectangle zoom (Shift + left drag)
+  - left-drag pan, right-click reset
   - status bar shows `xi/eta` + `lon/lat` (if available) + value
 
 ## Requirements
@@ -32,22 +31,14 @@ Python packages:
 - `numpy`
 - `matplotlib`
 - `netCDF4`
-- `tkinter` *(recommended)*
+- `PySide6` or `PyQt5`
 
-### macOS note (important)
-On macOS, Matplotlib’s **MacOSX** backend can crash when mixed with Tk dialogs.  
-This script is written to **prefer `TkAgg`** when `tkinter` is available.
-
-If you still see the backend as `MacOSX`, run:
+### Qt backend note
+The viewer uses Matplotlib’s Qt backend (`QtAgg`) with **PySide6** (preferred) or **PyQt5**.
+If you need to force a backend, use:
 
 ```bash
-MPLBACKEND=TkAgg python main.py <grid.nc> ...
-```
-
-You can verify your backend with:
-
-```bash
-python -c "import matplotlib; print(matplotlib.get_backend())"
+MPLBACKEND=QtAgg python main.py <grid.nc> ...
 ```
 
 ## Input expectations
@@ -65,7 +56,7 @@ You can still visualize other 2D variables if they exist.
   - `geometry.type == "Point"`
   - `geometry.coordinates == [lon, lat]`
 - Each feature may include `properties`:
-  - `depth` (meters, **positive down**) is used to compute `k` if `--s_rho` is provided.
+  - `depth` (meters, **positive down**) is used to compute `k` if `--s_w` is provided.
 
 ## Usage
 
@@ -76,7 +67,7 @@ python main.py path/to/grid.nc
 
 ### View a different 2D variable
 ```bash
-python main.py path/to/grid.nc --var h --cmap viridis
+python main.py path/to/grid.nc --var h
 ```
 
 ### Overlay GeoJSON sources
@@ -89,25 +80,25 @@ python main.py path/to/grid.nc --sources-geojson sources.geojson
 python main.py path/to/grid.nc --sources-geojson sources.geojson --snap-sources-to-sea
 ```
 
-### Export with vertical index `k` using `s_rho`
-Provide rho-level sigma coordinates as a comma-separated list (typical range `[-1, 0]`):
+### Export with vertical index `k` using `s_w`
+Provide w-level sigma coordinates as a comma-separated list (typical range `[-1, 0]`):
 
 ```bash
 python main.py path/to/grid.nc \
   --sources-geojson sources.geojson \
-  --s_rho -0.975,-0.925,-0.875,-0.825,-0.775,-0.725,-0.675,-0.625,-0.575,-0.525,-0.475,-0.425,-0.375,-0.325,-0.275,-0.225,-0.175,-0.125,-0.075,-0.025
+  --s_w -1.0,-0.9,-0.8,-0.7,-0.6,-0.5,-0.4,-0.3,-0.2,-0.1,0.0
 ```
 
 The script computes:
 
 - `H = h[j,i]`
 - `s_target = clamp(-depth/H, -1, 0)`
-- `k = argmin(|s_rho - s_target|)`
+- `k = -argmin(|s_w - s_target|)`
 
 and stores `k` into `properties.k`.
 
 Example:
---s_rho="-0.983333333333333,-0.95,-0.916666666666667,-0.883333333333333,-0.85,-0.816666666666667,-0.783333333333333,-0.75,-0.716666666666667,-0.683333333333333,-0.65,-0.616666666666667,-0.583333333333333,-0.55,-0.516666666666667,-0.483333333333333,-0.45,-0.416666666666667,-0.383333333333333,-0.35,-0.316666666666667,-0.283333333333333,-0.25,-0.216666666666667,-0.183333333333333,-0.15,-0.116666666666667,-0.0833333333333333,-0.05,-0.0166666666666667"
+--s_w="-0.983333333333333,-0.95,-0.916666666666667,-0.883333333333333,-0.85,-0.816666666666667,-0.783333333333333,-0.75,-0.716666666666667,-0.683333333333333,-0.65,-0.616666666666667,-0.583333333333333,-0.55,-0.516666666666667,-0.483333333333333,-0.45,-0.416666666666667,-0.383333333333333,-0.35,-0.316666666666667,-0.283333333333333,-0.25,-0.216666666666667,-0.183333333333333,-0.15,-0.116666666666667,-0.0833333333333333,-0.05,-0.0166666666666667"
 
 
 ### Non-interactive export fallback
@@ -125,24 +116,16 @@ Then click **Export JSON** and it will write to that path if needed.
 
 ### Mouse
 - **Wheel**: zoom in/out around cursor
-- **Drag rectangle**: zoom to region
-
-### Keyboard
-- `r` : reset view
-- `+` : zoom in (centered)
-- `-` : zoom out (centered)
+- **Shift + left drag**: zoom to region
+- **Left drag**: pan
+- **Right click**: reset view
 
 ### Widgets (when sources are loaded)
 - **Snap to sea** checkbox: toggles display of snapped positions
 - **Export JSON** button: writes updated GeoJSON/JSON with indices
 
-### Click on a source
-- shows an info box with:
-  - source index
-  - `(i, j)` indices
-  - `lon/lat` at the snapped/raw grid position (if available)
-  - up to 6 properties
-- if Tk dialogs are available, it opens a JSON editor for the properties
+### Double-click on a source
+- opens a JSON editor for the properties and lets you edit indices or depth
 
 ## Output format
 
@@ -165,12 +148,13 @@ The exported file is a JSON/GeoJSON FeatureCollection similar to input, with upd
 Notes:
 - `i` corresponds to **xi**
 - `j` corresponds to **eta**
-- `k` is optional (only if `--s_rho` is provided and `depth` exists)
+- `k` is optional (only if `--s_w` is provided and `depth` exists)
 
 ## Troubleshooting
 
-- **Crash on close / backend issues on macOS**:
-  - Force TkAgg: `MPLBACKEND=TkAgg python main.py ...`
+- **Qt backend errors**:
+  - Ensure you have **either** `PySide6` or `PyQt5` installed.
+  - Force the Qt backend: `MPLBACKEND=QtAgg python main.py ...`
 - **Sources loaded but not shown**:
   - ensure `lon_rho` and `lat_rho` exist in the NetCDF
   - ensure GeoJSON features are `Point` with `[lon,lat]`

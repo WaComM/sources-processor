@@ -5,4 +5,4 @@ netCDF4>=1.6
 
 # Qt bindings (install ONE of the following)
 PySide6>=6.5
-
+PyQt5>=5.15

@@ -24,6 +24,7 @@ import os
 import json
 import argparse
 import logging
+import re
 
 # ------------------------------
 # Qt imports (PySide6 preferred)
@@ -54,6 +55,9 @@ from netCDF4 import Dataset
 # ============================================================
 # Helpers
 # ============================================================
+FLOAT_RE = re.compile(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?")
+
+
 def parse_floats_from_any_text(text: str):
     """
     Parse floats from:
@@ -63,19 +67,8 @@ def parse_floats_from_any_text(text: str):
     """
     if text is None:
         return None
-    # Normalize separators to spaces, then split
-    for ch in [",", ";", "\t", "\r", "\n"]:
-        text = text.replace(ch, " ")
-    parts = [p.strip() for p in text.split(" ") if p.strip() != ""]
-    if not parts:
-        return None
-    out = []
-    for p in parts:
-        try:
-            out.append(float(p))
-        except Exception:
-            pass
-    return np.array(out, dtype=float) if out else None
+    values = [float(match.group(0)) for match in FLOAT_RE.finditer(text)]
+    return np.array(values, dtype=float) if values else None
 
 
 def parse_s_w(s: str):
@@ -337,6 +330,7 @@ class Viewer(QtWidgets.QMainWindow):
         # GeoJSON state
         self.gj = None
         self.src_feat_indices = None
+        self._sources_dirty = False
 
         # Plot
         self.fig, self.ax = plt.subplots()
@@ -494,7 +488,7 @@ class Viewer(QtWidgets.QMainWindow):
 
     def _on_snap_toggle(self):
         if self.gj is not None and self.src_feat_indices is not None and self.nc_path is not None:
-            self.recompute_sources_ijk()
+            self._sources_dirty = True
         self.update_sources()
 
     # ---------------- s_w CSV ----------------
@@ -516,7 +510,7 @@ class Viewer(QtWidgets.QMainWindow):
             self.status.showMessage(f"Loaded s_w from CSV (N={self.s_w.size}) -> recomputing k for sources")
             # Recompute k for all sources immediately
             if self.nc_path and self.gj is not None and self.src_feat_indices is not None:
-                self.recompute_sources_ijk()
+                self._sources_dirty = True
                 self.update_sources()
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Load s_w failed", str(e))
@@ -647,7 +641,7 @@ class Viewer(QtWidgets.QMainWindow):
         self.status.showMessage(f"Loaded NetCDF: {os.path.basename(path)}")
 
         if self.gj is not None and self.src_feat_indices is not None:
-            self.recompute_sources_ijk()
+            self._sources_dirty = True
 
         self.change_var(initial)
 
@@ -679,7 +673,7 @@ class Viewer(QtWidgets.QMainWindow):
         self.args.sources_geojson = path
         self.load_geojson(path)
         if self.nc_path:
-            self.recompute_sources_ijk()
+            self._sources_dirty = True
             self.update_sources()
         self.status.showMessage(f"Loaded GeoJSON: {os.path.basename(path)}")
 
@@ -687,7 +681,7 @@ class Viewer(QtWidgets.QMainWindow):
         self.gj, self.src_feat_indices = load_geojson_sources(path)
         self.btn_export.setEnabled(bool(self.nc_path and self.gj is not None and self.src_feat_indices is not None))
         if self.nc_path and self.gj is not None and self.src_feat_indices is not None:
-            self.recompute_sources_ijk()
+            self._sources_dirty = True
 
     def recompute_sources_ijk(self):
         """
@@ -732,6 +726,7 @@ class Viewer(QtWidgets.QMainWindow):
             props["i"] = i_idx
             props["j"] = j_idx
             props["k"] = self.compute_k(j_idx, i_idx, depth)
+        self._sources_dirty = False
 
     # ---------------- Plot / sources overlay ----------------
     def _ensure_secondary_axes(self):
@@ -810,7 +805,7 @@ class Viewer(QtWidgets.QMainWindow):
         self.fig.tight_layout()
         self.canvas.draw_idle()
 
-    def update_sources(self):
+    def update_sources(self, *, force_recompute=False):
         if self._scatter is not None:
             try:
                 self._scatter.remove()
@@ -822,7 +817,8 @@ class Viewer(QtWidgets.QMainWindow):
             self.canvas.draw_idle()
             return
 
-        self.recompute_sources_ijk()
+        if force_recompute or self._sources_dirty:
+            self.recompute_sources_ijk()
 
         feats = self.gj.get("features", [])
         xs, ys = [], []
@@ -921,7 +917,7 @@ class Viewer(QtWidgets.QMainWindow):
                 feat["properties"]["k"] = self.compute_k(j, i, depth)
             except Exception:
                 pass
-            self.update_sources()
+            self.update_sources(force_recompute=True)
 
     def _on_button_press_mpl(self, ev):
         if not getattr(ev, "dblclick", False):

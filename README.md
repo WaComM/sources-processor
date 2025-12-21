@@ -1,4 +1,4 @@
-# main.py — ROMS Grid Viewer & GeoJSON Source Processor
+# ROMS Grid Viewer & WaComM GeoJSON Source Processor
 
 An interactive Matplotlib viewer for **2D fields** in a **ROMS-style NetCDF grid**, with optional overlay of **Lagrangian particle sources** from GeoJSON and export of updated source indices (and optional vertical index `k` computed from depth using `s_w`).
 

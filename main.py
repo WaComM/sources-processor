@@ -88,7 +88,7 @@ def parse_s_w(s: str):
     return arr
 
 
-def snap_to_nearest_sea(xi, eta, mask, min_depth=0.0, h=None, rmax=50):
+def snap_to_nearest_sea(xi, eta, mask, min_depth=5.0, h=None, rmax=50):
     ny, nx = mask.shape
     i0, j0 = int(round(xi)), int(round(eta))
     i0 = int(np.clip(i0, 0, nx - 1))
@@ -336,7 +336,7 @@ class Viewer(QtWidgets.QMainWindow):
         self.mask_rho = None
         self.h = None
         self.full_extent = None
-        self.min_snap_depth = 0.0
+        self.min_snap_depth = 5.0
 
         # Mapper caches
         self._lon_sorted = None

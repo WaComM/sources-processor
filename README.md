@@ -15,7 +15,7 @@ This tool is designed for interactive exploration:
 - **Field visualization**: display any 2D variable in the NetCDF file via `--var`.
 - **Bathymetry contours**: draws contour lines from `h` (masked to sea if `mask_rho` exists).
 - **GeoJSON overlay**: reads `Point` features and plots them on the grid.
-- **Snap-to-sea**: move each source to nearest sea point using `mask_rho`.
+- **Snap-to-sea**: move each source to nearest sea point using `mask_rho`, with an optional minimum bathymetry depth filter (`h`).
 - **Export**:
   - adds `i` (xi) and `j` (eta) indices to each source feature properties
   - optionally adds `k` (vertical index) derived from a `depth` property using `--s_w`
@@ -122,6 +122,7 @@ Then click **Export JSON** and it will write to that path if needed.
 
 ### Widgets (when sources are loaded)
 - **Snap to sea** checkbox: toggles display of snapped positions
+- **Minimum source depth (m)**: only snap to sea cells with `h >=` the selected depth (0 disables filtering)
 - **Export JSON** button: writes updated GeoJSON/JSON with indices
 
 ### Double-click on a source
@@ -160,6 +161,7 @@ Notes:
   - ensure GeoJSON features are `Point` with `[lon,lat]`
 - **Snapping doesn’t work**:
   - `mask_rho` must exist and be compatible shape (eta, xi)
+  - for minimum-depth snapping, `h` must exist and use the same shape
 
 ## License
 

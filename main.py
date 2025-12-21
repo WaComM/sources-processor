@@ -88,13 +88,25 @@ def parse_s_w(s: str):
     return arr
 
 
-def snap_to_nearest_sea(xi, eta, mask, rmax=50):
+def snap_to_nearest_sea(xi, eta, mask, min_depth=0.0, h=None, rmax=50):
     ny, nx = mask.shape
     i0, j0 = int(round(xi)), int(round(eta))
     i0 = int(np.clip(i0, 0, nx - 1))
     j0 = int(np.clip(j0, 0, ny - 1))
 
-    if mask[j0, i0] >= 0.5:
+    min_depth_val = float(min_depth) if min_depth is not None else 0.0
+    use_depth = h is not None and np.isfinite(min_depth_val) and min_depth_val > 0.0
+
+    def _valid_cell(mask_cell, h_cell=None):
+        if mask_cell < 0.5:
+            return False
+        if not use_depth:
+            return True
+        if h_cell is None:
+            return False
+        return np.isfinite(h_cell) and h_cell >= min_depth_val
+
+    if _valid_cell(mask[j0, i0], h[j0, i0] if use_depth else None):
         return float(i0), float(j0)
 
     for r in range(1, rmax + 1):
@@ -104,7 +116,11 @@ def snap_to_nearest_sea(xi, eta, mask, rmax=50):
         j_max = min(ny - 1, j0 + r)
 
         sub = mask[j_min : j_max + 1, i_min : i_max + 1]
-        sea = sub >= 0.5
+        if use_depth:
+            h_sub = h[j_min : j_max + 1, i_min : i_max + 1]
+            sea = (sub >= 0.5) & np.isfinite(h_sub) & (h_sub >= min_depth_val)
+        else:
+            sea = sub >= 0.5
         if not np.any(sea):
             continue
 
@@ -320,6 +336,7 @@ class Viewer(QtWidgets.QMainWindow):
         self.mask_rho = None
         self.h = None
         self.full_extent = None
+        self.min_snap_depth = 0.0
 
         # Mapper caches
         self._lon_sorted = None
@@ -403,6 +420,7 @@ class Viewer(QtWidgets.QMainWindow):
     def _set_domain_loaded(self, loaded: bool):
         self.var_combo.setEnabled(loaded)
         self.chk_snap.setEnabled(loaded)
+        self.dbl_min_depth.setEnabled(loaded)
         self.btn_reset.setEnabled(loaded)
         self.btn_export.setEnabled(bool(loaded and self.gj is not None and self.src_feat_indices is not None))
 
@@ -474,6 +492,16 @@ class Viewer(QtWidgets.QMainWindow):
         self.chk_snap.stateChanged.connect(self._on_snap_toggle)
         layout.addWidget(self.chk_snap)
 
+        layout.addWidget(QtWidgets.QLabel("Minimum source depth (m):", w))
+        self.dbl_min_depth = QtWidgets.QDoubleSpinBox(w)
+        self.dbl_min_depth.setDecimals(2)
+        self.dbl_min_depth.setRange(0.0, 1e6)
+        self.dbl_min_depth.setSingleStep(1.0)
+        self.dbl_min_depth.setValue(self.min_snap_depth)
+        self.dbl_min_depth.setToolTip("Minimum bathymetry (h) for snapped sources. 0 disables filtering.")
+        self.dbl_min_depth.valueChanged.connect(self._on_min_depth_change)
+        layout.addWidget(self.dbl_min_depth)
+
         self.btn_reset = QtWidgets.QPushButton("Reset view (full)", w)
         self.btn_reset.clicked.connect(self.reset_view)
         layout.addWidget(self.btn_reset)
@@ -487,6 +515,12 @@ class Viewer(QtWidgets.QMainWindow):
         self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, dock)
 
     def _on_snap_toggle(self):
+        if self.gj is not None and self.src_feat_indices is not None and self.nc_path is not None:
+            self._sources_dirty = True
+        self.update_sources()
+
+    def _on_min_depth_change(self, value):
+        self.min_snap_depth = float(value)
         if self.gj is not None and self.src_feat_indices is not None and self.nc_path is not None:
             self._sources_dirty = True
         self.update_sources()
@@ -718,7 +752,13 @@ class Viewer(QtWidgets.QMainWindow):
                 continue
 
             if use_snap:
-                xi, eta = snap_to_nearest_sea(xi, eta, self.mask_rho)
+                xi, eta = snap_to_nearest_sea(
+                    xi,
+                    eta,
+                    self.mask_rho,
+                    min_depth=self.min_snap_depth,
+                    h=self.h,
+                )
 
             i_idx = int(round(xi))
             j_idx = int(round(eta))

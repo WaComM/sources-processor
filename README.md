@@ -10,6 +10,8 @@ This tool is designed for interactive exploration:
 - export updated GeoJSON/JSON with `i`, `j`, and optional `k`
 - click a source to inspect it (and optionally edit its properties via a JSON dialog)
 
+![GUI](docs/figures/figure01.png "The sources processor GUI")
+
 ## Features
 
 - **Field visualization**: display any 2D variable in the NetCDF file via `--var`.

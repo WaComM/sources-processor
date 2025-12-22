@@ -835,7 +835,21 @@ class Viewer(QtWidgets.QMainWindow):
                     vmin = float(np.nanmin(finite))
                     vmax = float(np.nanmax(finite))
                     if vmax > vmin:
-                        levels = np.linspace(vmin, vmax, 15)
+                        levels = [ 5, 10, 15, 20, 25, 30,
+                                   35, 40, 45, 50, 60, 70,
+                                   80, 90, 100, 110, 120,
+                                   130, 140, 150, 160, 170,
+                                   180, 200, 220, 240, 260,
+                                   280, 300, 325, 350, 375,
+                                   400, 425, 450, 475, 500,
+                                   550, 600, 650, 700, 750,
+                                   800, 850, 900, 950, 1000,
+                                   1100, 1200, 1300, 1400,
+                                   1500, 1600, 1700, 1800,
+                                   1900, 2000, 2100, 2200,
+                                   2300, 2400, 2500, 2600,
+                                   2700, 2800, 2900, 3000,
+                                   3250, 3500, 3750, 4000]
                         cs = self.ax.contour(h_plot, levels=levels, colors="k", linewidths=0.3)
                         self.ax.clabel(cs, inline=True, fontsize=6, fmt="%.0f")
             except Exception as e:
